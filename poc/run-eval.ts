@@ -11,7 +11,7 @@
  *   node --experimental-strip-types poc/run-eval.ts qwen3:8b,gemma3:4b 20
  */
 import { z } from "zod";
-import { TEST_CASES, type ExpectedItem, type TestCase } from "./test-memos.js";
+import { TEST_CASES, type ExpectedItem, type TestCase } from "./test-memos.ts";
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
 
