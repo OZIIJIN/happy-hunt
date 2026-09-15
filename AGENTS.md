@@ -117,3 +117,16 @@ npm run format          # prettier
 - 워크트리와 원본 체크아웃 사이에서 파일을 `cp` 등으로 직접 복사하지 않는다. git이
   추적하는 파일과 충돌해 다음 `pull`이 깨질 수 있다. 동기화는 `main` 병합과
   원본 체크아웃에서의 `git pull`만으로 한다.
+
+## 커밋 컨벤션
+
+커밋 메시지는 `type: 설명` 형식을 따른다 (Conventional Commits 스타일).
+
+- `feat`: 새 기능 추가
+- `fix`: 버그 수정
+- `refactor`: 동작 변화 없는 코드 구조 개선
+- `test`: 테스트 추가/수정
+- `docs`: 문서 변경 (AGENTS.md, CLAUDE.md, README 등)
+- `chore`: 위에 속하지 않는 잡다한 작업 (의존성 업데이트, 설정 변경 등)
+
+예: `feat: 아이템 추출 결과를 보관함에 저장`, `docs: Git 작업 규칙 추가`
