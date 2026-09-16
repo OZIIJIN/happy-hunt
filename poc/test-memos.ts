@@ -414,7 +414,7 @@ export const TEST_CASES: TestCase[] = [
   // --- 활동 (12) ---
   {
     memo: "오랜만에 자전거를 타고 한강을 달리는데 바람이 시원했다.",
-    expected: [{ name: "자전거 타기", category: "활동" }],
+    expected: [{ name: "자전거", category: "활동" }],
   },
   {
     memo: "친구들이랑 밤새 보드게임을 하면서 시간 가는 줄 몰랐다.",
@@ -434,11 +434,11 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "서툴게 구운 빵이지만 처음으로 완성했을 때 뿌듯했다.",
-    expected: [{ name: "빵 굽기", category: "활동" }],
+    expected: [{ name: "빵", category: "활동" }],
   },
   {
     memo: "밤늦게까지 그림을 그리다 완성작을 보고 혼자 뿌듯해했다.",
-    expected: [{ name: "그림 그리기", category: "활동" }],
+    expected: [{ name: "그림", category: "활동" }],
   },
   {
     memo: "오랜만에 수영장에서 자유형을 완주했을 때 성취감이 컸다.",
