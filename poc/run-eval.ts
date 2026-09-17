@@ -18,6 +18,12 @@ const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
 const DEFAULT_MODELS = ["qwen3:8b", "qwen2.5:7b", "qwen2.5:3b"];
 const DEFAULT_LIMIT = 50;
 
+// 로컬 모델은 JSON Schema로 형식을 유도해도 가끔(모델에 따라 10%대 확률로) JSON
+// 문법 자체가 깨지거나 스키마를 어기는 응답을 낸다 — 연속 호출 중에만 간헐적으로
+// 나타나고 재현이 잘 안 되는 걸로 봐서 일종의 샘플링 변동성으로 보인다. 재시도
+// 횟수를 넉넉히 잡아 방어한다.
+const MAX_ATTEMPTS = 4;
+
 const CATEGORIES = ["음식", "장소", "자연", "사물", "동물", "활동", "기타"] as const;
 
 const RESPONSE_JSON_SCHEMA = {
@@ -67,8 +73,9 @@ const SYSTEM_PROMPT = `너는 "행복찾기" 앱의 아이템 추출 엔진이�
 - "오늘", "행복", "좋았다"처럼 감정 서술어나 일반 명사는 아이템으로 뽑지 않는다.
 - 그 순간을 대표하는 구체적 사물/음식/장소/자연/동물/활동 요소를 우선한다.
   카테고리 사이에 우선순위는 없다 — 문장에 등장한 각 요소를 해당 카테고리 그대로 뽑는다.
-- 사람(친구, 가족 등 실존 인물)은 아이템으로 뽑지 않는다. 사람만 등장하고 다른
-  구체물이 없으면 items는 빈 배열이다.
+- "동물"은 사람이 아닌 생물만 해당한다(고양이, 강아지, 앵무새 등). 사람(친구, 가족,
+  아기, 타인 등 모든 인간과 그 신체 부위·행동)은 어떤 카테고리로도, "동물"에도
+  뽑지 않는다. 사람만 등장하고 다른 구체물이 없으면 items는 빈 배열이다.
 - 문장에 명시적으로 등장하거나 강하게 암시된 것만 뽑는다. 지어내지 않는다.
 - "바람", "냄새", "소리", "온도"처럼 형체 없는 감각은 아이템으로 뽑지 않는다 —
   대신 visual_description이나 primary_emotion에 반영한다.
@@ -77,6 +84,32 @@ const SYSTEM_PROMPT = `너는 "행복찾기" 앱의 아이템 추출 엔진이�
 - 문장에 구체적 요소가 여러 개 있으면 하나로 합치지 말고 각각 별도 아이템으로 뽑는다.
 - 구체적인 아이템이 하나도 없으면 items를 빈 배열로 반환한다. 억지로 만들어내지 않는다.
 - 반드시 JSON만 출력한다. 설명이나 <think> 같은 부연 텍스트를 붙이지 않는다.`;
+
+// 로컬 모델은 규칙 텍스트만으로는 "동물 카테고리에 사람을 넣지 마라" 같은 경계를
+// 잘 못 지킨다 — few-shot 예시를 대화 턴에 끼워 넣어 패턴을 보강한다.
+// (평가 데이터셋의 케이스를 그대로 예시로 쓰면 그 케이스만 편법으로 맞히게 되므로
+// test-memos.ts에 없는 문장으로 새로 만든다.)
+const FEW_SHOT_EXAMPLES: { memo: string; response: string }[] = [
+  {
+    memo: "오랜만에 연락 온 옛 동료와 반갑게 안부를 나눴다.",
+    response: JSON.stringify({ items: [], primary_emotion: "반가움" }),
+  },
+  {
+    memo: "산책 중에 만난 강아지가 꼬리를 흔들며 다가왔다.",
+    response: JSON.stringify({
+      items: [
+        {
+          name: "강아지",
+          category: "동물",
+          evidence: "강아지가 꼬리를 흔들며 다가왔다",
+          visual_description: "복슬복슬한 갈색 털, 신나게 흔드는 꼬리",
+          uniqueness: "common",
+        },
+      ],
+      primary_emotion: "반가움",
+    }),
+  },
+];
 
 interface OllamaChatResponse {
   message: { content: string };
@@ -96,6 +129,10 @@ async function callOllama(model: string, memo: string): Promise<OllamaChatRespon
       format: RESPONSE_JSON_SCHEMA,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
+        ...FEW_SHOT_EXAMPLES.flatMap((ex) => [
+          { role: "user", content: ex.memo },
+          { role: "assistant", content: ex.response },
+        ]),
         { role: "user", content: memo },
       ],
     }),
@@ -109,15 +146,26 @@ async function callOllama(model: string, memo: string): Promise<OllamaChatRespon
 }
 
 async function extractWithRetry(model: string, memo: string) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const response = await callOllama(model, memo);
-    const parsed = ExtractionResult.safeParse(JSON.parse(response.message.content));
+  let lastRawContent = "";
 
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const response = await callOllama(model, memo);
+    lastRawContent = response.message.content;
+
+    let json: unknown;
+    try {
+      json = JSON.parse(lastRawContent);
+    } catch {
+      continue;
+    }
+
+    const parsed = ExtractionResult.safeParse(json);
     if (parsed.success) {
       return { data: parsed.data, response, attempt, schemaFailures: attempt - 1 };
     }
   }
-  throw new Error(`"${memo}" 추출이 2회 모두 스키마 검증에 실패했다`);
+  console.log(`  [${model}] ${MAX_ATTEMPTS}회 모두 실패한 마지막 원본 응답:\n${lastRawContent}`);
+  throw new Error(`"${memo}" 추출이 ${MAX_ATTEMPTS}회 모두 실패했다`);
 }
 
 /** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치 + 이름 부분 포함(양방향). */
