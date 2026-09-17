@@ -3,10 +3,14 @@
  * 각 메모에 "정답(expected)"을 같이 넣어서, 모델 출력과 기계적으로 비교해
  * 정확도를 잴 수 있게 한다 (콘솔에 찍어놓고 눈으로 보는 것보다 재현 가능함).
  *
- * 카테고리 분포(음식/장소/자연/사물/사람_동물/활동 각 12~18개)와,
+ * 카테고리 분포(음식/장소/자연/사물/동물/활동 각 12~18개)와,
  * 의도적으로 "명확한 아이템이 없는" 엣지 케이스 10개(expected: [])를 섞었다 —
  * 후자는 모델이 억지로 아이템을 만들어내지 않고 items를 적게/비워
  * 반환하는지 확인하기 위한 것.
+ *
+ * 사람(친구/가족 등 실존 인물)은 아이템 카테고리에서 제외했다 (AGENTS.md
+ * "사람_동물 분리" 결정 참고) — 그래서 사람만 등장하고 다른 구체물이 없는
+ * 메모는 expected: []가 정답이다 (엣지 케이스와 동일하게 취급).
  *
  * 정답 name은 "정답 라벨"이지 모델이 뱉어야 할 정확한 문자열이 아니다.
  * 채점할 때는 완전 일치 대신 부분 일치/포함 관계로 비교하는 걸 추천한다
@@ -22,7 +26,7 @@ export type ItemCategory =
   | "장소"
   | "자연"
   | "사물"
-  | "사람_동물"
+  | "동물"
   | "활동"
   | "기타";
 
@@ -212,7 +216,7 @@ export const TEST_CASES: TestCase[] = [
     memo: "퇴근하고 강아지랑 산책하는데 하늘에 별이 엄청 많았다.",
     expected: [
       { name: "별", category: "자연" },
-      { name: "강아지", category: "사람_동물" },
+      { name: "강아지", category: "동물" },
     ],
   },
   {
@@ -340,75 +344,66 @@ export const TEST_CASES: TestCase[] = [
     expected: [{ name: "니트 스웨터", category: "사물" }],
   },
 
-  // --- 사람_동물 (15) ---
+  // --- 동물(5) + 사람만 등장(아이템 없음, 7) + 복합(3) — 원래 "사람_동물" 15개 ---
   {
     memo: "오랜만에 옛날 친구를 만나서 옛날 이야기하면서 엄청 웃었다.",
-    expected: [{ name: "친구", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "아기 조카가 처음으로 내 이름을 부르는 걸 듣고 울컥했다.",
-    expected: [{ name: "조카", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "길고양이가 무릎 위에 올라와 잠든 걸 한참 지켜봤다.",
-    expected: [{ name: "길고양이", category: "사람_동물" }],
+    expected: [{ name: "길고양이", category: "동물" }],
   },
   {
     memo: "할머니가 손을 꼭 잡아주시는데 그 온기가 오래 남았다.",
-    expected: [{ name: "할머니", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "강아지가 산책 내내 꼬리를 흔들며 옆에 붙어 있었다.",
-    expected: [{ name: "강아지", category: "사람_동물" }],
+    expected: [{ name: "강아지", category: "동물" }],
   },
   {
     memo: "동생이 몰래 준비한 깜짝 선물에 눈물이 났다.",
-    expected: [
-      { name: "선물", category: "사물" },
-      { name: "동생", category: "사람_동물" },
-    ],
+    expected: [{ name: "선물", category: "사물" }],
   },
   {
     memo: "친구가 힘든 얘기를 다 들어주고 안아줬을 때 위로가 됐다.",
-    expected: [{ name: "친구", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "처음 만난 유기견이 낯가림 없이 다가와 손을 핥았다.",
-    expected: [{ name: "유기견", category: "사람_동물" }],
+    expected: [{ name: "유기견", category: "동물" }],
   },
   {
     memo: "아빠가 오랜만에 서툰 요리를 해주셔서 웃음이 났다.",
-    expected: [{ name: "아빠", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "새로 사귄 친구와 밤새 통화하면서 시간 가는 줄 몰랐다.",
-    expected: [{ name: "친구", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "앵무새가 처음으로 내 이름을 따라 말해서 신기했다.",
-    expected: [{ name: "앵무새", category: "사람_동물" }],
+    expected: [{ name: "앵무새", category: "동물" }],
   },
   {
     memo: "할아버지가 옛날 사진첩을 꺼내 하나하나 설명해주셨다.",
-    expected: [
-      { name: "할아버지", category: "사람_동물" },
-      { name: "사진첩", category: "사물" },
-    ],
+    expected: [{ name: "사진첩", category: "사물" }],
   },
   {
     memo: "여행지에서 만난 낯선 여행자와 밤새 이야기를 나눴다.",
-    expected: [{ name: "여행자", category: "사람_동물" }],
+    expected: [],
   },
   {
     memo: "조카가 그려준 삐뚤빼뚤한 우리 가족 그림을 냉장고에 붙였다.",
-    expected: [
-      { name: "그림", category: "사물" },
-      { name: "조카", category: "사람_동물" },
-    ],
+    expected: [{ name: "그림", category: "사물" }],
   },
   {
     memo: "고양이가 처음으로 내 무릎에서 골골 소리를 냈다.",
-    expected: [{ name: "고양이", category: "사람_동물" }],
+    expected: [{ name: "고양이", category: "동물" }],
   },
 
   // --- 활동 (12) ---
@@ -434,7 +429,7 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "서툴게 구운 빵이지만 처음으로 완성했을 때 뿌듯했다.",
-    expected: [{ name: "빵", category: "활동" }],
+    expected: [{ name: "베이킹", category: "활동" }],
   },
   {
     memo: "밤늦게까지 그림을 그리다 완성작을 보고 혼자 뿌듯해했다.",
