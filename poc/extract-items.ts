@@ -100,31 +100,12 @@ const TEST_MEMOS = [
   "오랜만에 옛날 친구를 만나서 옛날 이야기하면서 엄청 웃었다.",
 ];
 
-// 로컬 모델은 규칙 텍스트만으로는 "동물 카테고리에 사람을 넣지 마라" 같은 경계를
-// 잘 못 지킨다 — few-shot 예시를 대화 턴에 끼워 넣어 패턴을 보강한다.
-// (평가 데이터셋의 케이스를 그대로 예시로 쓰면 그 케이스만 편법으로 맞히게 되므로
-// test-memos.ts에 없는 문장으로 새로 만든다.)
-const FEW_SHOT_EXAMPLES: { memo: string; response: string }[] = [
-  {
-    memo: "오랜만에 연락 온 옛 동료와 반갑게 안부를 나눴다.",
-    response: JSON.stringify({ items: [], primary_emotion: "반가움" }),
-  },
-  {
-    memo: "산책 중에 만난 강아지가 꼬리를 흔들며 다가왔다.",
-    response: JSON.stringify({
-      items: [
-        {
-          name: "강아지",
-          category: "동물",
-          evidence: "강아지가 꼬리를 흔들며 다가왔다",
-          visual_description: "복슬복슬한 갈색 털, 신나게 흔드는 꼬리",
-          uniqueness: "common",
-        },
-      ],
-      primary_emotion: "반가움",
-    }),
-  },
-];
+// few-shot 예시(대화 턴에 예시 user/assistant 쌍 추가)로 "사람은 동물에도 뽑지
+// 않는다" 규칙을 보강해봤지만, gemma3:4b 100케이스 평가에서 매치율 70.1%→67.0%,
+// 엣지케이스 통과율 64.7%→29.4%로 오히려 나빠져 롤백했다 (poc/eval-results.md 참고).
+// 원래 고치려던 문제는 안 고쳐지고 관련 없는 카테고리(사물→장소)까지 깨진 걸 보면,
+// 컨텍스트가 늘어나면서 시스템 프롬프트 지시에 대한 주의가 흐트러진 것으로 보인다 —
+// 3~8B급 로컬 모델은 few-shot보다 규칙 텍스트만으로 유지하는 게 낫다.
 
 interface OllamaChatResponse {
   message: { content: string };
@@ -144,10 +125,6 @@ async function callOllama(memo: string): Promise<OllamaChatResponse> {
       format: RESPONSE_JSON_SCHEMA,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        ...FEW_SHOT_EXAMPLES.flatMap((ex) => [
-          { role: "user", content: ex.memo },
-          { role: "assistant", content: ex.response },
-        ]),
         { role: "user", content: memo },
       ],
     }),
