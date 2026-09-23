@@ -122,6 +122,22 @@ async function callOllama(model: string, memo: string): Promise<OllamaChatRespon
   return res.json() as Promise<OllamaChatResponse>;
 }
 
+/**
+ * ollama는 모델을 요청 사이에 메모리에 계속 들고 있다가 유휴 상태가 일정 시간
+ * 지나야 내린다. 여러 모델을 순서대로 비교하는 이 스크립트에서는 그 유휴 시간이
+ * 오기 전에 다음 모델을 또 로드하게 되어, 여러 모델이 동시에 메모리에 쌓인다 —
+ * 이 머신은 여유 메모리가 넉넉하지 않아 이 상태에서 추론이 극단적으로 느려지고
+ * 5분 안에 응답을 못 받으면 fetch 자체가 실패한다. 모델을 바꾸기 전에 명시적으로
+ * 언로드해서 항상 하나의 모델만 메모리에 남도록 한다.
+ */
+async function unloadModel(model: string) {
+  await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages: [], keep_alive: 0 }),
+  });
+}
+
 async function extractWithRetry(model: string, memo: string) {
   let lastRawContent = "";
 
@@ -274,11 +290,10 @@ async function main() {
     console.log(`\n### ${model} 시작 ###`);
     const stats = await runEval(model, cases);
     allStats.push(stats);
+    printModelReport(stats);
+    await unloadModel(model);
   }
 
-  for (const stats of allStats) {
-    printModelReport(stats);
-  }
   printComparisonTable(allStats);
 }
 
