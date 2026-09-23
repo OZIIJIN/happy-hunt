@@ -16,7 +16,7 @@
 import { z } from "zod";
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
-const MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5:7b";
+const MODEL = process.env.OLLAMA_MODEL ?? "gemma3:4b";
 
 // 로컬 모델은 JSON Schema로 형식을 유도해도 가끔(모델에 따라 10%대 확률로) JSON
 // 문법 자체가 깨지거나 스키마를 어기는 응답을 낸다 — 연속 호출 중에만 간헐적으로
