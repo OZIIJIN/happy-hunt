@@ -121,7 +121,7 @@ async function callOllama(memo: string): Promise<OllamaChatResponse> {
     body: JSON.stringify({
       model: MODEL,
       stream: false,
-      options: { temperature: 0.2 },
+      options: { temperature: 0 },
       format: RESPONSE_JSON_SCHEMA,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
