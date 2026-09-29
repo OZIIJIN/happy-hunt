@@ -2,8 +2,12 @@
  * test-memos.ts의 TEST_CASES(정답 포함)를 여러 로컬 모델로 돌려서
  * 정확도/속도를 비교한다.
  *
- * extract-items.ts와 추출 로직(스키마/프롬프트/재시도)은 동일하게 맞췄다 —
- * 이 파일은 그 위에 "정답과 비교해서 채점 + 모델간 비교"를 추가한 버전이다.
+ * extract-items.ts와 추출 로직(3단계 파이프라인: 후보추출 → 분류 → 구체화)은
+ * 동일하게 맞췄다 — 이 파일은 그 위에 "정답과 비교해서 채점 + 모델간 비교"를
+ * 추가한 버전이다. 3단계 세부 설계 이유는 extract-items.ts 헤더 주석 참고.
+ *
+ * test-memos.ts의 정답 카테고리는 한글(음식/장소/자연/사물/동물/활동)이고 파이프라인의
+ * 최종 카테고리는 영어(FOOD/PLACE/...)라 CATEGORY_KO_TO_EN으로 채점 시에만 매핑한다.
  *
  * 실행 (기본: qwen3:8b, qwen2.5:7b, qwen2.5:3b를 각 50개 케이스로 비교):
  *   node --experimental-strip-types poc/run-eval.ts
@@ -24,73 +28,37 @@ const DEFAULT_LIMIT = 50;
 // 횟수를 넉넉히 잡아 방어한다.
 const MAX_ATTEMPTS = 4;
 
-const CATEGORIES = ["음식", "장소", "자연", "사물", "동물", "활동", "기타"] as const;
+const CATEGORIES = [
+  "FOOD",
+  "PLACE",
+  "OBJECT",
+  "NATURE",
+  "ANIMAL",
+  "ACTIVITY",
+  "PERSON",
+  "EMOTION_REACTION",
+  "SENSORY",
+  "GENERIC",
+  "OTHER",
+] as const;
+type Category = (typeof CATEGORIES)[number];
 
-const RESPONSE_JSON_SCHEMA = {
-  type: "object",
-  properties: {
-    items: {
-      type: "array",
-      maxItems: 5,
-      items: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "아이템의 짧은 한글 이름" },
-          category: { type: "string", enum: CATEGORIES },
-          evidence: { type: "string", description: "근거가 된 원문 구절 그대로 인용" },
-          visual_description: {
-            type: "string",
-            description: "아이콘 생성용 시각적 특징(색감/형태/분위기)",
-          },
-          uniqueness: { type: "string", enum: ["common", "rare"] },
-        },
-        required: ["name", "category", "evidence", "visual_description", "uniqueness"],
-      },
-    },
-    primary_emotion: { type: ["string", "null"], description: "주된 감정 한 단어, 애매하면 null" },
-  },
-  required: ["items", "primary_emotion"],
+// "버릴 이유"를 하나의 IGNORE로 뭉치면 모델이 왜 버려야 하는지 판단하기 어렵다 —
+// 대신 버리는 이유별로 카테고리를 나누면(사람/감정반응/감각/일반표현/기타) 모델
+// 입장에서 "왜 버릴지" 자체가 긍정적인 분류 문제가 된다. keep 여부는 모델에게
+// 시키지 않고, 분류된 category를 code가 이 화이트리스트로 판정한다.
+const KEEP_CATEGORIES = new Set<Category>(["FOOD", "PLACE", "OBJECT", "NATURE", "ANIMAL", "ACTIVITY"]);
+
+const UNIQUENESS_LEVELS = ["GENERIC", "SPECIFIC", "DISTINCTIVE"] as const;
+
+const CATEGORY_KO_TO_EN: Record<string, Category> = {
+  음식: "FOOD",
+  장소: "PLACE",
+  사물: "OBJECT",
+  자연: "NATURE",
+  동물: "ANIMAL",
+  활동: "ACTIVITY",
 };
-
-const HappyItem = z.object({
-  name: z.string(),
-  category: z.enum(CATEGORIES),
-  evidence: z.string(),
-  visual_description: z.string(),
-  uniqueness: z.enum(["common", "rare"]),
-});
-
-const ExtractionResult = z.object({
-  items: z.array(HappyItem).max(5),
-  primary_emotion: z.string().nullable(),
-});
-
-const SYSTEM_PROMPT = `너는 "행복찾기" 앱의 아이템 추출 엔진이다.
-사용자가 소소한 행복의 순간을 적은 메모에서, 나중에 게임 아이템/아이콘으로 만들 수 있는
-"그 경험만의 특색있는 아이템"을 추출한다.
-
-규칙:
-- "오늘", "행복", "좋았다"처럼 감정 서술어나 일반 명사는 아이템으로 뽑지 않는다.
-- 그 순간을 대표하는 구체적 사물/음식/장소/자연/동물/활동 요소를 우선한다.
-  카테고리 사이에 우선순위는 없다 — 문장에 등장한 각 요소를 해당 카테고리 그대로 뽑는다.
-- "동물"은 사람이 아닌 생물만 해당한다(고양이, 강아지, 앵무새 등). 사람(친구, 가족,
-  아기, 타인 등 모든 인간과 그 신체 부위·행동)은 어떤 카테고리로도, "동물"에도
-  뽑지 않는다. 사람만 등장하고 다른 구체물이 없으면 items는 빈 배열이다.
-- 문장에 명시적으로 등장하거나 강하게 암시된 것만 뽑는다. 지어내지 않는다.
-- "바람", "냄새", "소리", "온도"처럼 형체 없는 감각은 아이템으로 뽑지 않는다 —
-  대신 visual_description이나 primary_emotion에 반영한다.
-- 활동(예: "요가", "수영", "클라이밍")은 그 자체로 유효한 아이템이다. 관련 도구가
-  문장에 없다면 도구를 지어내지 말고 활동명을 그대로 뽑는다.
-- 문장에 구체적 요소가 여러 개 있으면 하나로 합치지 말고 각각 별도 아이템으로 뽑는다.
-- 구체적인 아이템이 하나도 없으면 items를 빈 배열로 반환한다. 억지로 만들어내지 않는다.
-- 반드시 JSON만 출력한다. 설명이나 <think> 같은 부연 텍스트를 붙이지 않는다.`;
-
-// few-shot 예시(대화 턴에 예시 user/assistant 쌍 추가)로 "사람은 동물에도 뽑지
-// 않는다" 규칙을 보강해봤지만, gemma3:4b 100케이스 평가에서 매치율 70.1%→67.0%,
-// 엣지케이스 통과율 64.7%→29.4%로 오히려 나빠져 롤백했다 (poc/eval-results.md 참고).
-// 원래 고치려던 문제는 안 고쳐지고 관련 없는 카테고리(사물→장소)까지 깨진 걸 보면,
-// 컨텍스트가 늘어나면서 시스템 프롬프트 지시에 대한 주의가 흐트러진 것으로 보인다 —
-// 3~8B급 로컬 모델은 few-shot보다 규칙 텍스트만으로 유지하는 게 낫다.
 
 interface OllamaChatResponse {
   message: { content: string };
@@ -99,7 +67,12 @@ interface OllamaChatResponse {
   total_duration?: number;
 }
 
-async function callOllama(model: string, memo: string): Promise<OllamaChatResponse> {
+async function callOllama(
+  model: string,
+  systemPrompt: string,
+  jsonSchema: object,
+  userContent: string,
+): Promise<OllamaChatResponse> {
   const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -107,10 +80,10 @@ async function callOllama(model: string, memo: string): Promise<OllamaChatRespon
       model,
       stream: false,
       options: { temperature: 0 },
-      format: RESPONSE_JSON_SCHEMA,
+      format: jsonSchema,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: memo },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
       ],
     }),
   });
@@ -138,11 +111,19 @@ async function unloadModel(model: string) {
   });
 }
 
-async function extractWithRetry(model: string, memo: string) {
+/** 세 단계가 공유하는 "JSON Schema로 유도 + Zod로 검증 + 실패 시 재시도" 루프. */
+async function callWithRetry<S extends z.ZodTypeAny>(
+  model: string,
+  stageLabel: string,
+  systemPrompt: string,
+  jsonSchema: object,
+  userContent: string,
+  zodSchema: S,
+): Promise<{ data: z.infer<S>; response: OllamaChatResponse; schemaFailures: number }> {
   let lastRawContent = "";
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const response = await callOllama(model, memo);
+    const response = await callOllama(model, systemPrompt, jsonSchema, userContent);
     lastRawContent = response.message.content;
 
     let json: unknown;
@@ -152,20 +133,306 @@ async function extractWithRetry(model: string, memo: string) {
       continue;
     }
 
-    const parsed = ExtractionResult.safeParse(json);
+    const parsed = zodSchema.safeParse(json);
     if (parsed.success) {
-      return { data: parsed.data, response, attempt, schemaFailures: attempt - 1 };
+      return { data: parsed.data, response, schemaFailures: attempt - 1 };
     }
   }
-  console.log(`  [${model}] ${MAX_ATTEMPTS}회 모두 실패한 마지막 원본 응답:\n${lastRawContent}`);
-  throw new Error(`"${memo}" 추출이 ${MAX_ATTEMPTS}회 모두 실패했다`);
+
+  console.log(`  [${model}/${stageLabel}] ${MAX_ATTEMPTS}회 모두 실패한 마지막 원본 응답:\n${lastRawContent}`);
+  throw new Error(`[${stageLabel}] ${MAX_ATTEMPTS}회 모두 실패했다`);
 }
 
-/** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치 + 이름 부분 포함(양방향). */
+// ============================================================
+// 1단계 — Candidate Recall: 판단/필터링 없이 후보를 빠짐없이 뽑는다.
+// ============================================================
+
+const CANDIDATE_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    candidates: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          evidence: { type: "string" },
+        },
+        required: ["name", "evidence"],
+      },
+    },
+  },
+  required: ["candidates"],
+};
+
+const Candidate = z.object({ name: z.string(), evidence: z.string() });
+const CandidateResult = z.object({ candidates: z.array(Candidate) });
+
+const CANDIDATE_SYSTEM_PROMPT = `너는 문장에서 아이템 후보를 찾는 추출기다.
+
+입력 문장에 실제로 등장한 구체적인 대상과 활동 표현을 빠짐없이 찾아라.
+
+추출 대상:
+- 사물
+- 음식
+- 장소
+- 자연물
+- 동물
+- 사람 및 신체 부위
+- 구체적인 활동
+
+규칙:
+1. 대표적인 하나만 고르지 말고, 해당하는 후보를 모두 추출한다.
+2. 후보를 분류하거나 제거하지 않는다.
+3. 사람이나 신체 부위도 후보로 등장하면 추출한다.
+4. 입력 문장에 없는 대상을 추측하거나 만들어내지 않는다.
+5. 후보 이름은 가능하면 원문의 표현을 그대로 사용한다.
+6. evidence에는 해당 후보를 확인할 수 있는 원문의 짧은 구절을 그대로 넣는다.
+7. 서로 다른 후보를 하나의 아이템으로 합치지 않는다.
+8. 같은 대상을 반복해서 추출하지 않는다.
+9. 추출할 후보가 없다면 candidates를 빈 배열로 반환한다.
+10. 반드시 지정된 JSON 형식으로만 응답한다.`;
+
+// ============================================================
+// 2단계 — Classification: 후보를 카테고리로 분류한다. keep 여부는 모델에게
+// 시키지 않고, 분류된 category를 code가 KEEP_CATEGORIES로 판정한다.
+// ============================================================
+
+const CLASSIFY_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          evidence: { type: "string" },
+          category: { type: "string", enum: CATEGORIES },
+        },
+        required: ["name", "evidence", "category"],
+      },
+    },
+  },
+  required: ["items"],
+};
+
+const ClassifiedCandidate = z.object({
+  name: z.string(),
+  evidence: z.string(),
+  category: z.enum(CATEGORIES),
+});
+const ClassifyResult = z.object({ items: z.array(ClassifiedCandidate) });
+
+const CLASSIFY_SYSTEM_PROMPT = `너는 아이템 후보 분류기다.
+
+각 후보를 반드시 아래 카테고리 중 하나로만 분류한다.
+
+분류 우선순위:
+1. 후보가 사람, 인간관계, 신체 부위라면 다른 의미를 고려하지 말고 반드시 PERSON으로
+   분류한다.
+2. PERSON이 아닌 경우에만 나머지 카테고리를 판단한다.
+
+예:
+- 친구 → PERSON
+- 엄마 → PERSON
+- 사람 → PERSON
+- 손 → PERSON
+- 얼굴 → PERSON
+- 고양이 → ANIMAL
+
+중요: 인간은 이 태스크에서 절대 ANIMAL로 분류하지 않는다.
+
+KEEP:
+- FOOD: 음식, 음료
+- PLACE: 장소, 공간
+- OBJECT: 구체적인 사물
+- NATURE: 구체적인 자연물 또는 자연 현상
+- ANIMAL: 사람이 아닌 동물
+- ACTIVITY: 의도적으로 수행하는 구체적인 활동/취미
+  예: 산책, 수영, 요가, 독서, 클라이밍
+
+DROP:
+- PERSON: 사람, 사람을 가리키는 표현, 신체 부위
+- EMOTION_REACTION: 감정이나 감정에 따른 반응
+  예: 행복, 마음, 웃음, 울음, 미소
+- SENSORY: 형체 없는 감각
+  예: 냄새, 소리, 따뜻함, 시원함
+- GENERIC: 시간, 날짜, 너무 일반적이거나 추상적인 표현
+  예: 오늘, 하루, 날, 아침, 저녁
+- OTHER: 위 분류에 해당하지 않으며 아이템으로 쓰기 어려운 표현
+
+추가 기준:
+- "비" → NATURE
+- "날" → GENERIC
+- "웃음" → EMOTION_REACTION
+- "산책" → ACTIVITY
+- "할아버지" → PERSON
+- "할아버지 사진첩" → OBJECT
+
+규칙:
+1. 입력 후보만 분류한다.
+2. 후보 이름과 evidence는 수정하지 않는다.
+3. 새로운 후보를 추가하지 않는다.
+4. 애매하면 KEEP 카테고리에 억지로 넣지 말고 OTHER로 분류한다.
+5. category만 판단한다. keep 여부는 출력하지 않는다.
+6. 반드시 JSON만 출력한다.`;
+
+// ============================================================
+// 3단계 — Item Enrichment: KEEP 카테고리로 분류된 최종 아이템만 구체화한다.
+// ============================================================
+
+const ENRICH_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    items: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          evidence: { type: "string" },
+          category: { type: "string", enum: CATEGORIES },
+          visual_description: { type: "string" },
+          uniqueness: { type: "string", enum: UNIQUENESS_LEVELS },
+        },
+        required: ["name", "evidence", "category", "visual_description", "uniqueness"],
+      },
+    },
+  },
+  required: ["items"],
+};
+
+const EnrichedItem = z.object({
+  name: z.string(),
+  evidence: z.string(),
+  category: z.enum(CATEGORIES),
+  visual_description: z.string(),
+  uniqueness: z.enum(UNIQUENESS_LEVELS),
+});
+const EnrichResult = z.object({ items: z.array(EnrichedItem) });
+
+const ENRICH_SYSTEM_PROMPT = `너는 최종 아이템을 아이콘 생성에 사용할 수 있도록 구체화하는 역할이다.
+
+입력으로 주어진 아이템은 이미 추출과 필터링이 끝난 최종 아이템이다.
+
+각 아이템에 대해 다음 두 필드를 생성한다.
+
+visual_description
+- 해당 아이템을 하나의 작은 아이콘으로 표현하기 위한 시각적 설명
+- 아이템의 형태, 특징, 색이나 질감 등 눈에 보이는 요소 위주로 작성한다.
+- 장면 전체를 설명하지 않는다.
+- 사람이나 원문에 없는 새로운 물체를 임의로 추가하지 않는다.
+- 간결하게 작성한다.
+
+uniqueness
+- 이 아이템이 해당 순간에서 얼마나 구체적이고 특징적인지를 분류한다.
+
+값은 다음 중 하나다.
+
+GENERIC
+- 너무 흔하거나 범용적인 아이템
+- 예: 물, 의자, 길
+
+SPECIFIC
+- 어느 정도 구체적인 특징이 있는 아이템
+- 예: 치킨, 커피, 벚꽃
+
+DISTINCTIVE
+- 해당 경험을 강하게 떠올릴 수 있을 정도로 구체적인 아이템
+- 예: 딸기 생크림 케이크, 노을 진 한강, 할아버지의 낡은 사진첩
+
+규칙:
+
+1. 입력으로 주어진 아이템을 삭제하거나 추가하지 않는다.
+2. name, evidence, category는 수정하지 않는다.
+3. 입력에 없는 사실을 지어내지 않는다.
+4. visual_description은 아이콘 제작자가 바로 그림으로 옮길 수 있도록 시각적으로 작성한다.
+5. visual_description에 감정이나 추상적인 설명보다 보이는 특징을 우선한다.
+6. uniqueness는 아이템 이름과 evidence를 기준으로 판단한다.
+7. 모든 아이템에 visual_description과 uniqueness를 반드시 작성한다.
+8. 반드시 지정된 JSON 형식으로만 응답한다.`;
+
+interface FinalItem {
+  name: string;
+  evidence: string;
+  category: Category;
+  visual_description: string;
+  uniqueness: (typeof UNIQUENESS_LEVELS)[number];
+}
+
+interface PipelineResult {
+  items: FinalItem[];
+  schemaFailures: number;
+  totalPromptTokens: number;
+  totalOutputTokens: number;
+  totalDurationMs: number;
+}
+
+/** 1단계(후보추출) → 2단계(분류) → 3단계(구체화)를 순서대로 실행한다. */
+async function extractPipeline(model: string, memo: string): Promise<PipelineResult> {
+  const result: PipelineResult = {
+    items: [],
+    schemaFailures: 0,
+    totalPromptTokens: 0,
+    totalOutputTokens: 0,
+    totalDurationMs: 0,
+  };
+  const track = (response: OllamaChatResponse, schemaFailures: number) => {
+    result.schemaFailures += schemaFailures;
+    result.totalPromptTokens += response.prompt_eval_count ?? 0;
+    result.totalOutputTokens += response.eval_count ?? 0;
+    result.totalDurationMs += (response.total_duration ?? 0) / 1_000_000;
+  };
+
+  const stage1 = await callWithRetry(
+    model,
+    "1단계",
+    CANDIDATE_SYSTEM_PROMPT,
+    CANDIDATE_JSON_SCHEMA,
+    memo,
+    CandidateResult,
+  );
+  track(stage1.response, stage1.schemaFailures);
+  if (stage1.data.candidates.length === 0) {
+    return result;
+  }
+
+  const stage2 = await callWithRetry(
+    model,
+    "2단계",
+    CLASSIFY_SYSTEM_PROMPT,
+    CLASSIFY_JSON_SCHEMA,
+    JSON.stringify({ candidates: stage1.data.candidates }),
+    ClassifyResult,
+  );
+  track(stage2.response, stage2.schemaFailures);
+
+  const kept = stage2.data.items.filter((item) => KEEP_CATEGORIES.has(item.category));
+  if (kept.length === 0) {
+    return result;
+  }
+
+  const stage3 = await callWithRetry(
+    model,
+    "3단계",
+    ENRICH_SYSTEM_PROMPT,
+    ENRICH_JSON_SCHEMA,
+    JSON.stringify({ items: kept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
+    EnrichResult,
+  );
+  track(stage3.response, stage3.schemaFailures);
+
+  result.items = stage3.data.items;
+  return result;
+}
+
+/** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치(한글→영어 매핑) + 이름 부분 포함(양방향). */
 function isMatched(expected: ExpectedItem, actual: { name: string; category: string }[]) {
+  const expectedCategory = CATEGORY_KO_TO_EN[expected.category] ?? expected.category;
   return actual.some(
     (a) =>
-      a.category === expected.category &&
+      a.category === expectedCategory &&
       (a.name.includes(expected.name) || expected.name.includes(a.name)),
   );
 }
@@ -202,22 +469,23 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
   for (const [i, testCase] of cases.entries()) {
     process.stdout.write(`  [${model}] [${i + 1}/${cases.length}] `);
     try {
-      const { data, response, schemaFailures } = await extractWithRetry(model, testCase.memo);
+      const { items, schemaFailures, totalPromptTokens, totalOutputTokens, totalDurationMs } =
+        await extractPipeline(model, testCase.memo);
       stats.schemaFailures += schemaFailures;
-      stats.totalPromptTokens += response.prompt_eval_count ?? 0;
-      stats.totalOutputTokens += response.eval_count ?? 0;
-      stats.totalDurationMs += (response.total_duration ?? 0) / 1_000_000;
+      stats.totalPromptTokens += totalPromptTokens;
+      stats.totalOutputTokens += totalOutputTokens;
+      stats.totalDurationMs += totalDurationMs;
 
       if (testCase.expected.length === 0) {
         stats.edgeCaseTotal++;
-        const pass = data.items.length === 0;
+        const pass = items.length === 0;
         if (pass) stats.edgeCasePassed++;
-        console.log(pass ? "엣지케이스 통과" : `엣지케이스 실패 (${data.items.length}개)`);
+        console.log(pass ? "엣지케이스 통과" : `엣지케이스 실패 (${items.length}개)`);
         if (!pass) {
           stats.failures.push({
             memo: testCase.memo,
             expected: [],
-            actual: data.items.map((it) => `${it.name}(${it.category})`),
+            actual: items.map((it) => `${it.name}(${it.category})`),
           });
         }
         continue;
@@ -226,7 +494,7 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
       stats.totalExpected += testCase.expected.length;
       let caseMatched = 0;
       for (const exp of testCase.expected) {
-        if (isMatched(exp, data.items)) {
+        if (isMatched(exp, items)) {
           stats.matchedCount++;
           caseMatched++;
         }
@@ -237,7 +505,7 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
         stats.failures.push({
           memo: testCase.memo,
           expected: testCase.expected,
-          actual: data.items.map((it) => `${it.name}(${it.category})`),
+          actual: items.map((it) => `${it.name}(${it.category})`),
         });
       }
     } catch (err) {
