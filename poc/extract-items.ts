@@ -229,11 +229,22 @@ const CLASSIFY_SYSTEM_PROMPT = `너는 아이템 후보 분류기다.
 KEEP:
 - FOOD: 음식, 음료
 - PLACE: 장소, 공간
-- OBJECT: 구체적인 사물
+- OBJECT: 사람이 만들거나 사용하는 구체적인 물건. 다른 KEEP 카테고리(FOOD, PLACE,
+  NATURE, ANIMAL, ACTIVITY)에 해당하지 않을 때만 선택한다.
+  예: 책, 우산, 카메라, 사진첩, 가방
+  OBJECT가 아닌 것:
+  - 먹거나 마시는 것 → FOOD
+  - 방문하거나 머무를 수 있는 공간 → PLACE
+  - 식물, 꽃, 자연물, 자연현상 → NATURE
+  - 사람이 아닌 생물 → ANIMAL
+  - 수행하는 행동이나 취미 → ACTIVITY
 - NATURE: 구체적인 자연물 또는 자연 현상
 - ANIMAL: 사람이 아닌 동물
 - ACTIVITY: 의도적으로 수행하는 구체적인 활동/취미
   예: 산책, 수영, 요가, 독서, 클라이밍
+
+중요: 다른 KEEP 카테고리에 해당하면 OBJECT보다 해당 카테고리를 우선한다.
+OBJECT는 나머지 카테고리 어디에도 안 들어갈 때만 쓰는 최후의 선택지다.
 
 DROP:
 - PERSON: 사람, 사람을 가리키는 표현, 신체 부위
@@ -252,6 +263,12 @@ DROP:
 - "산책" → ACTIVITY
 - "할아버지" → PERSON
 - "할아버지 사진첩" → OBJECT
+- "딸기 케이크" → FOOD (OBJECT 아님)
+- "만두" → FOOD (OBJECT 아님)
+- "서점" → PLACE (OBJECT 아님)
+- "봉숭아" → NATURE (OBJECT 아님)
+- "책" → OBJECT
+- "우산" → OBJECT
 
 규칙:
 1. 입력 후보만 분류한다.
