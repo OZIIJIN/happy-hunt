@@ -2,19 +2,26 @@
  * POC: 행복 메모(자연어 문장)에서 "그 순간만의 특색있는 아이템"을 추출한다.
  * 추출에 쓰는 LLM은 로컬(Ollama)이다 — 외부 API 키가 필요 없다.
  *
- * 3단계 파이프라인 (recall → precision → enrichment로 관심사 분리):
+ * 파이프라인 (recall → ontology 분류 → 제품 정책 판정 → enrichment로 관심사 분리):
  *   1단계 후보 추출 — 문장에 등장한 후보를 필터링 없이 최대한 빠짐없이 뽑는다
  *     (사람/감각 표현도 포함해서 다 뽑는다. recall 중심).
- *   2단계 분류 — 후보 하나하나를 카테고리로만 분류한다(새 후보를 만들거나 keep
- *     여부를 직접 판단하지 않는다. precision 중심). "버릴 이유"를 하나의 IGNORE로
- *     뭉치지 않고 PERSON/EMOTION_REACTION/SENSORY/GENERIC/OTHER로 세분화해서,
- *     모델에게는 "왜 버릴지"까지 긍정적인 분류 문제로 준다. keep 여부는 code가
- *     KEEP_CATEGORIES 화이트리스트로 판정한다.
- *   3단계 구체화 — 2단계에서 KEEP 카테고리로 분류된 최종 아이템에 대해서만 아이콘
- *     생성용 visual_description/uniqueness를 만든다 (생존 여부는 다시 판단하지 않는다).
+ *   2단계 분류 — 후보 하나하나를 "이게 의미적으로 무엇이냐"만으로 카테고리에
+ *     분류한다. "버릴 이유"를 하나의 IGNORE로 뭉치지 않고
+ *     PERSON/EMOTION_REACTION/SENSORY/GENERIC/OTHER로 세분화한다. 중요: 여기서는
+ *     "이게 앱 아이템으로 쓸 만한가" 같은 제품 정책은 묻지 않는다 — ontology
+ *     분류와 제품 정책을 한 번에 물으면 모델이 둘을 뒤섞어 판단한다(예: "통화"가
+ *     ACTIVITY인지와, 통화를 아이템으로 줄지를 같은 질문으로 취급).
+ *   2.5단계 — ACTIVITY 수집 가치 판정: 2단계에서 ACTIVITY로 분류된 후보만 모아,
+ *     "앱의 수집 아이템으로 쓸 만큼 독립적인 활동인가"를 원문 맥락과 함께 판정한다.
+ *     여기서만 제품 정책(COLLECTIBLE/NOT_COLLECTIBLE)을 다룬다. 2단계와 2.5단계를
+ *     분리하면 "통화 = ACTIVITY"(2단계, 맞음)와 "통화 = NOT_COLLECTIBLE"(2.5단계,
+ *     맞음)가 서로 모순 없이 공존한다.
+ *   3단계 구체화 — 2단계(ACTIVITY 외) + 2.5단계(COLLECTIBLE로 판정된 ACTIVITY)를
+ *     통과한 최종 아이템에 대해서만 아이콘 생성용 visual_description/uniqueness를
+ *     만든다 (생존 여부는 다시 판단하지 않는다).
  * 각 단계가 딱 하나의 일만 하게 나누면, "사람 오분류"는 2단계 분류 문제로,
- * "엣지케이스 과다추출"은 2단계 DROP 카테고리 판정 문제로, "다중 아이템 누락"은
- * 1단계 recall 문제로 분리된다 — 예전처럼 하나의 프롬프트/매치율에 세 문제가
+ * "엣지케이스 과다추출"은 2.5단계 COLLECTIBLE 판정 문제로, "다중 아이템 누락"은
+ * 1단계 recall 문제로 분리된다 — 예전처럼 하나의 프롬프트/매치율에 여러 문제가
  * 섞이지 않는다.
  *
  * 클라우드 API와 다른 점: 로컬 모델은 "스키마를 어겼을 때" 재시도/검증을 앱이 직접
@@ -207,84 +214,163 @@ const ClassifiedCandidate = z.object({
 });
 const ClassifyResult = z.object({ items: z.array(ClassifiedCandidate) });
 
-const CLASSIFY_SYSTEM_PROMPT = `너는 아이템 후보 분류기다.
+const CLASSIFY_SYSTEM_PROMPT = `너는 아이템 후보의 의미적 카테고리를 분류하는 분류기다.
 
 각 후보를 반드시 아래 카테고리 중 하나로만 분류한다.
 
 분류 우선순위:
-1. 후보가 사람, 인간관계, 신체 부위라면 다른 의미를 고려하지 말고 반드시 PERSON으로
-   분류한다.
+1. 후보가 사람, 인간관계, 신체 부위라면 반드시 PERSON으로 분류한다.
 2. PERSON이 아닌 경우에만 나머지 카테고리를 판단한다.
 
-예:
-- 친구 → PERSON
-- 엄마 → PERSON
-- 사람 → PERSON
-- 손 → PERSON
-- 얼굴 → PERSON
-- 고양이 → ANIMAL
-
-중요: 인간은 이 태스크에서 절대 ANIMAL로 분류하지 않는다.
-
-KEEP:
+KEEP 계열:
 - FOOD: 음식, 음료
 - PLACE: 장소, 공간
-- OBJECT: 사람이 만들거나 사용하는 구체적인 물건. 다른 KEEP 카테고리(FOOD, PLACE,
-  NATURE, ANIMAL, ACTIVITY)에 해당하지 않을 때만 선택한다.
+- OBJECT: 사람이 만들거나 사용하는 구체적인 물건.
+  FOOD, PLACE, NATURE, ANIMAL, ACTIVITY에 해당하지 않을 때만 선택한다.
   예: 책, 우산, 카메라, 사진첩, 가방
-  OBJECT가 아닌 것:
-  - 먹거나 마시는 것 → FOOD
-  - 방문하거나 머무를 수 있는 공간 → PLACE
-  - 식물, 꽃, 자연물, 자연현상 → NATURE
-  - 사람이 아닌 생물 → ANIMAL
-  - 수행하는 행동이나 취미 → ACTIVITY
 - NATURE: 구체적인 자연물 또는 자연 현상
 - ANIMAL: 사람이 아닌 동물
-- ACTIVITY: 그 행동 자체가 하나의 독립적인 경험이나 수집 아이템으로 볼 수 있는
-  구체적인 활동.
-  예: 산책, 수영, 요가, 독서, 클라이밍, 캠핑, 자전거 타기
+- ACTIVITY: 사람이 수행하는 구체적인 행동이나 활동
+  예: 산책, 수영, 요가, 독서, 클라이밍, 통화, 이야기하기, 눕기, 잠자기
 
-  다음과 같은 단순한 일상 행동이나 상태는 ACTIVITY가 아니다.
-  예: 이야기하기, 통화하기, 눕기, 쉬기, 잠자기, 안아주기
-  → OTHER
-
-중요: 다른 KEEP 카테고리에 해당하면 OBJECT보다 해당 카테고리를 우선한다.
-OBJECT는 나머지 카테고리 어디에도 안 들어갈 때만 쓰는 최후의 선택지다.
-
-DROP:
-- PERSON: 사람, 사람을 가리키는 표현, 신체 부위
+DROP 계열:
+- PERSON: 사람, 인간관계 표현, 신체 부위
 - EMOTION_REACTION: 감정이나 감정에 따른 반응
   예: 행복, 마음, 웃음, 울음, 미소
 - SENSORY: 형체 없는 감각
   예: 냄새, 소리, 따뜻함, 시원함
 - GENERIC: 시간, 날짜, 너무 일반적이거나 추상적인 표현
   예: 오늘, 하루, 날, 아침, 저녁
-- OTHER: 위 분류에 해당하지 않으며 아이템으로 쓰기 어려운 표현
+- OTHER: 위 카테고리 중 어느 것에도 해당하지 않는 표현
 
-추가 기준:
-- "비" → NATURE
-- "날" → GENERIC
-- "웃음" → EMOTION_REACTION
-- "산책" → ACTIVITY
-- "할아버지" → PERSON
-- "할아버지 사진첩" → OBJECT
-- "딸기 케이크" → FOOD (OBJECT 아님)
-- "만두" → FOOD (OBJECT 아님)
-- "서점" → PLACE (OBJECT 아님)
-- "봉숭아" → NATURE (OBJECT 아님)
-- "책" → OBJECT
-- "우산" → OBJECT
+중요:
+- 인간은 절대 ANIMAL로 분류하지 않는다.
+- 다른 카테고리에 해당하면 OBJECT보다 해당 카테고리를 우선한다.
+- OBJECT는 다른 구체적인 카테고리에 해당하지 않는 물건에만 사용한다.
+- ACTIVITY에서는 그 활동이 앱에서 좋은 아이템인지 판단하지 않는다.
+  사람이 수행하는 행동/활동인지 의미만 분류한다.
+
+예:
+- 친구 → PERSON
+- 엄마 → PERSON
+- 고양이 → ANIMAL
+- 딸기 케이크 → FOOD
+- 만두 → FOOD
+- 서점 → PLACE
+- 봉숭아 → NATURE
+- 책 → OBJECT
+- 우산 → OBJECT
+- 산책 → ACTIVITY
+- 통화 → ACTIVITY
+- 이야기 → ACTIVITY
+- 눕기 → ACTIVITY
+- 날 → GENERIC
+- 웃음 → EMOTION_REACTION
 
 규칙:
 1. 입력 후보만 분류한다.
 2. 후보 이름과 evidence는 수정하지 않는다.
 3. 새로운 후보를 추가하지 않는다.
-4. 애매하면 KEEP 카테고리에 억지로 넣지 말고 OTHER로 분류한다.
-5. category만 판단한다. keep 여부는 출력하지 않는다.
-6. 반드시 JSON만 출력한다.`;
+4. category만 판단한다.
+5. 반드시 JSON만 출력한다.`;
 
 // ============================================================
-// 3단계 — Item Enrichment: keep=true인 최종 아이템만 아이콘 생성용으로 구체화한다.
+// 2.5단계 — ACTIVITY Collectibility: 2단계에서 ACTIVITY로 분류된 후보만 모아,
+// "앱의 수집 아이템으로 쓸 만큼 독립적인 활동인가"를 원문 맥락과 함께 판정한다.
+// 2단계(ontology 분류)와 제품 정책 판정을 한 질문으로 섞지 않기 위해 분리했다 —
+// "통화 = ACTIVITY"(2단계)와 "통화 = NOT_COLLECTIBLE"(2.5단계)가 모순 없이 공존한다.
+// ============================================================
+
+const ACTIVITY_FILTER_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    activities: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          result: { type: "string", enum: ["COLLECTIBLE", "NOT_COLLECTIBLE"] },
+        },
+        required: ["name", "result"],
+      },
+    },
+  },
+  required: ["activities"],
+};
+
+const ActivityVerdict = z.object({
+  name: z.string(),
+  result: z.enum(["COLLECTIBLE", "NOT_COLLECTIBLE"]),
+});
+const ActivityFilterResult = z.object({ activities: z.array(ActivityVerdict) });
+
+const ACTIVITY_FILTER_SYSTEM_PROMPT = `너는 활동 후보가 "행복찾기" 앱의 수집 아이템으로
+사용할 만한 독립적인 활동인지 판정한다.
+
+입력에는 원문과 ACTIVITY 후보들이 주어진다.
+
+각 후보를 다음 중 하나로 판정한다.
+
+COLLECTIBLE:
+- 행동 자체가 하나의 독립적인 경험이나 활동으로 볼 수 있다.
+- 그 활동 자체만으로도 사용자가 무엇을 했는지 구체적으로 떠올릴 수 있다.
+- 하나의 아이콘으로 수집할 만한 활동이다.
+- 예: 산책, 수영, 요가, 독서, 클라이밍, 캠핑, 자전거 타기
+
+NOT_COLLECTIBLE:
+- 사람과의 관계나 교류를 보조하는 일상적인 행동
+- 단순한 자세, 상태 또는 휴식
+- 문장의 배경이 되는 부수적인 행동
+- 사물의 상태 변화나 사람이 수행하지 않은 동작
+- 그 행동만 떼어놓으면 독립적인 수집 경험으로 보기 어려운 것
+
+판단할 때 후보 문자열만 보지 말고 반드시 원문과 evidence를 함께 본다.
+
+예:
+원문: "친구와 한참 이야기했다."
+후보: "이야기"
+→ NOT_COLLECTIBLE
+
+원문: "친구와 오랜만에 통화했다."
+후보: "통화"
+→ NOT_COLLECTIBLE
+
+원문: "오늘 침대에 누워만 있었다."
+후보: "누워"
+→ NOT_COLLECTIBLE
+
+원문: "늦잠을 잤다."
+후보: "늦잠"
+→ NOT_COLLECTIBLE
+
+원문: "계란말이가 조금 탔다."
+후보: "탔다"
+→ NOT_COLLECTIBLE
+
+원문: "저녁에 공원을 산책했다."
+후보: "산책"
+→ COLLECTIBLE
+
+원문: "오랜만에 자전거를 탔다."
+후보: "자전거 타기"
+→ COLLECTIBLE
+
+원문: "카페에서 책을 읽었다."
+후보: "독서"
+→ COLLECTIBLE
+
+규칙:
+1. 입력으로 받은 ACTIVITY 후보만 판정한다.
+2. 새로운 후보를 추가하거나 후보 이름을 수정하지 않는다.
+3. 단어 형태가 아니라 원문의 의미와 문맥을 기준으로 판단한다.
+4. 모든 후보에 대해 COLLECTIBLE 또는 NOT_COLLECTIBLE 중 하나만 선택한다.
+5. 반드시 JSON만 출력한다.`;
+
+// ============================================================
+// 3단계 — Item Enrichment: 2단계(ACTIVITY 제외 KEEP 카테고리) + 2.5단계
+// (COLLECTIBLE로 판정된 ACTIVITY)를 통과한 최종 아이템만 아이콘 생성용으로
+// 구체화한다.
 // ============================================================
 
 const ENRICH_JSON_SCHEMA = {
@@ -410,7 +496,33 @@ async function main() {
     }
 
     const kept = stage2.data.items.filter((item) => KEEP_CATEGORIES.has(item.category));
-    if (kept.length === 0) {
+    const activityCandidates = kept.filter((item) => item.category === "ACTIVITY");
+    const nonActivityKept = kept.filter((item) => item.category !== "ACTIVITY");
+
+    let collectibleActivities: typeof activityCandidates = [];
+    if (activityCandidates.length > 0) {
+      const stage2_5 = await callWithRetry(
+        "2.5단계 활동판정",
+        ACTIVITY_FILTER_SYSTEM_PROMPT,
+        ACTIVITY_FILTER_JSON_SCHEMA,
+        JSON.stringify({
+          memo,
+          activities: activityCandidates.map(({ name, evidence }) => ({ name, evidence })),
+        }),
+        ActivityFilterResult,
+      );
+      trackUsage(stage2_5.response);
+      for (const v of stage2_5.data.activities) {
+        console.log(`  [2.5단계/${v.result}] ${v.name}`);
+      }
+      const collectibleNames = new Set(
+        stage2_5.data.activities.filter((v) => v.result === "COLLECTIBLE").map((v) => v.name),
+      );
+      collectibleActivities = activityCandidates.filter((item) => collectibleNames.has(item.name));
+    }
+
+    const finalKept = [...nonActivityKept, ...collectibleActivities];
+    if (finalKept.length === 0) {
       console.log("  → 최종 아이템 없음");
       continue;
     }
@@ -419,7 +531,7 @@ async function main() {
       "3단계 구체화",
       ENRICH_SYSTEM_PROMPT,
       ENRICH_JSON_SCHEMA,
-      JSON.stringify({ items: kept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
+      JSON.stringify({ items: finalKept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
       EnrichResult,
     );
     trackUsage(stage3.response);
