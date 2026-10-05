@@ -16,6 +16,9 @@
  *     여기서만 제품 정책(COLLECTIBLE/NOT_COLLECTIBLE)을 다룬다. 2단계와 2.5단계를
  *     분리하면 "통화 = ACTIVITY"(2단계, 맞음)와 "통화 = NOT_COLLECTIBLE"(2.5단계,
  *     맞음)가 서로 모순 없이 공존한다.
+ *     (한 번 모든 KEEP 후보로 범위를 넓혀봤지만 Context Rejection Rate가
+ *     41.4%까지 떨어지고 엣지케이스가 94.1%→58.8%로 무너져서 ACTIVITY 전용으로
+ *     되돌렸다 — poc/eval-results.md 참고.)
  *   3단계 구체화 — 2단계(ACTIVITY 외) + 2.5단계(COLLECTIBLE로 판정된 ACTIVITY)를
  *     통과한 최종 아이템에 대해서만 아이콘 생성용 visual_description/uniqueness를
  *     만든다 (생존 여부는 다시 판단하지 않는다).
@@ -279,6 +282,8 @@ DROP 계열:
 // "앱의 수집 아이템으로 쓸 만큼 독립적인 활동인가"를 원문 맥락과 함께 판정한다.
 // 2단계(ontology 분류)와 제품 정책 판정을 한 질문으로 섞지 않기 위해 분리했다 —
 // "통화 = ACTIVITY"(2단계)와 "통화 = NOT_COLLECTIBLE"(2.5단계)가 모순 없이 공존한다.
+// 모든 KEEP 후보로 범위를 넓혀본 적이 있는데, Context Rejection Rate가 41.4%까지
+// 떨어지고 엣지케이스가 94.1%→58.8%로 무너져서 ACTIVITY 전용으로 되돌렸다.
 // ============================================================
 
 const ACTIVITY_FILTER_JSON_SCHEMA = {

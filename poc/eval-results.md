@@ -310,3 +310,44 @@ DROP 카테고리 판정 문제로, "다중 아이템 누락"은 1단계 recall 
   절의 "사람 오분류 0/7" 결과가 여기서도 뒤집히는지 확인할 가치가 있음.
 - 3단계(구체화)에서 나온 `visual_description`/`uniqueness` 품질 자체는 아직
   정량 평가 안 함 — 지금까지는 사람 처리/엣지케이스 수치화에 집중.
+
+---
+
+## 2.5단계를 "모든 KEEP 후보"로 일반화 시도 → 롤백 (2026-10-05)
+
+2.5단계(ACTIVITY 전용 COLLECTIBLE/NOT_COLLECTIBLE 판정)가 잘 작동하는 걸 보고,
+같은 판정을 FOOD/PLACE/OBJECT/NATURE/ANIMAL까지 모든 KEEP 후보로 넓혀봤다
+("한강", "창문" 같은 배경 요소도 걸러내자는 아이디어). `gemma3:4b-it-q8_0` 단독으로
+baseline(ACTIVITY 전용, 매치율 80.4%/엣지케이스 94.1%) 대비 100케이스 재검증했다.
+
+이번엔 Final Match/Edge-case 두 지표만 보지 않고, 2.5단계 자체의 정밀도를 따로
+측정했다 — Collectible Recall(정답 중 2.5가 제대로 살린 비율), Context Rejection
+Rate(배경 후보 중 2.5가 제대로 죽인 비율), False Drop/Keep 건수.
+
+| 지표 | ACTIVITY 전용(baseline) | 모든 KEEP 후보로 확장 |
+| --- | --- | --- |
+| Final Match Rate | 80.4% | 73.2% (71/97) |
+| Edge-case Pass Rate | 94.1% | **58.8%** (10/17) |
+| Collectible Recall | - | 88.8% (71/80) |
+| Context Rejection Rate | - | **41.4%** (53/128) |
+| False Drop | - | 9건 |
+| False Keep | - | **44건** |
+
+**원인**: Context Rejection Rate 41.4%가 핵심 — 배경 후보 128개 중 절반도 못
+거르고 44개를 COLLECTIBLE로 잘못 살렸다. ACTIVITY만 좁게 물었을 때는 잘 판별하던
+모델이, FOOD/PLACE/OBJECT/NATURE까지 범위를 넓히자 "구체적인 명사면 일단
+COLLECTIBLE"로 되돌아갔다 — 이 프로젝트에서 반복 확인된 "판단 범위를 넓히면
+소형 모델의 판단력이 흐려진다" 패턴이 2.5단계에서도 재현된 것이다.
+
+False Keep 예시(배경인데 살림): 창가(PLACE), 국물(OBJECT), 국밥집(PLACE),
+옥상(PLACE), 호수(PLACE), 창문(OBJECT), 통화(ACTIVITY), 자전거(OBJECT로 오분류된
+채 유지) 등.
+
+False Drop 예시(정답인데 죽임): 평상(OBJECT), 야경(PLACE), 카페(PLACE),
+목욕탕 벽화(OBJECT), 빵집(PLACE), 텐트(OBJECT), 설경(NATURE), 흙냄새(NATURE).
+
+**결론**: ACTIVITY 전용 범위가 더 나은 설계였다. 코드를 ACTIVITY 전용 2.5단계로
+되돌렸다(`poc/extract-items.ts`, `poc/run-eval.ts`). "배경 요소 전반을 거르는"
+더 넓은 목표 자체는 유효해 보이지만, 지금 쓰는 4B급 로컬 모델에게 한 번에 맡기기엔
+범위가 너무 넓다 — 다음에 다시 시도한다면 카테고리별로 쪼개서(예: PLACE 전용
+collectibility 판정을 별도 단계로) 시도하는 게 이번 실패에서 얻은 교훈과 맞을 것.
