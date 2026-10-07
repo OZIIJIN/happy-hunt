@@ -32,6 +32,10 @@ export type ItemCategory =
 
 export interface ExpectedItem {
   name: string;
+  /** 원문에 등장하는 표현만 다른 같은 개념(예: "수영"의 "자유형"). 서로 다른
+   * 개념(예: "국밥"과 "국밥집")에는 쓰지 않는다 — 그런 건 모델이 잘못 뽑은
+   * 것으로 계속 잡아야 한다. */
+  aliases?: string[];
   category: ItemCategory;
 }
 
@@ -256,7 +260,9 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "여름 소나기가 지나간 뒤 흙냄새가 진하게 올라왔다.",
-    expected: [{ name: "흙냄새", category: "자연" }],
+    // "냄새"는 ontology상 SENSORY(형체 없는 감각)로 DROP 대상이라 — 아이템
+    // 추출 정책과 일관되게 정답도 빈 배열로 둔다.
+    expected: [],
   },
   {
     memo: "노을이 지는 하늘이 그날따라 유난히 주황빛이었다.",
@@ -429,7 +435,7 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "서툴게 구운 빵이지만 처음으로 완성했을 때 뿌듯했다.",
-    expected: [{ name: "베이킹", category: "활동" }],
+    expected: [{ name: "베이킹", aliases: ["빵 굽기"], category: "활동" }],
   },
   {
     memo: "밤늦게까지 그림을 그리다 완성작을 보고 혼자 뿌듯해했다.",
@@ -437,7 +443,7 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "오랜만에 수영장에서 자유형을 완주했을 때 성취감이 컸다.",
-    expected: [{ name: "수영", category: "활동" }],
+    expected: [{ name: "수영", aliases: ["자유형"], category: "활동" }],
   },
   {
     memo: "친구와 처음으로 도예 체험을 했는데 생각보다 재미있었다.",
@@ -453,7 +459,9 @@ export const TEST_CASES: TestCase[] = [
   },
   {
     memo: "오랜만에 피아노 앞에 앉아 예전에 치던 곡을 다시 쳤다.",
-    expected: [{ name: "피아노", category: "사물" }],
+    // "자전거를 타다"/"그림을 그리다"와 같은 기준(행위 자체가 활동)으로 통일 —
+    // 전엔 "사물"(피아노라는 물건)로 잡혀 있었다.
+    expected: [{ name: "피아노 연주", aliases: ["피아노"], category: "활동" }],
   },
 
   // --- 엣지 케이스: 명확한 아이템이 없거나 애매함 (10) ---

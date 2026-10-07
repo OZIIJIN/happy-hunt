@@ -556,10 +556,9 @@ async function extractPipeline(model: string, memo: string): Promise<PipelineRes
 /** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치(한글→영어 매핑) + 이름 부분 포함(양방향). */
 function isMatched(expected: ExpectedItem, actual: { name: string; category: string }[]) {
   const expectedCategory = CATEGORY_KO_TO_EN[expected.category] ?? expected.category;
+  const names = [expected.name, ...(expected.aliases ?? [])];
   return actual.some(
-    (a) =>
-      a.category === expectedCategory &&
-      (a.name.includes(expected.name) || expected.name.includes(a.name)),
+    (a) => a.category === expectedCategory && names.some((n) => a.name.includes(n) || n.includes(a.name)),
   );
 }
 
