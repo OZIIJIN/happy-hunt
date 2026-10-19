@@ -9,17 +9,27 @@
  * test-memos.ts의 정답 카테고리는 한글(음식/장소/자연/사물/동물/활동)이고 파이프라인의
  * 최종 카테고리는 영어(FOOD/PLACE/...)라 CATEGORY_KO_TO_EN으로 채점 시에만 매핑한다.
  *
+ * 데이터셋 500개(test-memos.ts) / 원래 100개(test-memos-100.ts) 중 선택 가능 —
+ * TEST_SET=100 환경변수를 주면 100개짜리로 돈다(기존 실험 기록과 바로 비교 가능,
+ * 500개는 모델 하나당 몇 시간씩 걸림). 기본값은 500개 전체.
+ *
  * 실행 (기본: qwen3:8b, qwen2.5:7b, qwen2.5:3b를 각 50개 케이스로 비교):
  *   node --experimental-strip-types poc/run-eval.ts
  * 모델/케이스 수 직접 지정:
  *   node --experimental-strip-types poc/run-eval.ts qwen3:8b,gemma3:4b 20
+ * 원래 100개 데이터셋으로 돌리기:
+ *   TEST_SET=100 node --experimental-strip-types poc/run-eval.ts gemma3:4b-it-q8_0 999
  */
 import { z } from "zod";
-import { TEST_CASES, type ExpectedItem, type TestCase } from "./test-memos.ts";
+import { TEST_CASES as TEST_CASES_500, type ExpectedItem, type TestCase } from "./test-memos.ts";
+import { TEST_CASES as TEST_CASES_100 } from "./test-memos-100.ts";
+
+const DATASET = process.env.TEST_SET === "100" ? TEST_CASES_100 : TEST_CASES_500;
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
 
-const DEFAULT_MODELS = ["qwen3:8b", "qwen2.5:7b", "qwen2.5:3b"];
+// gemma3:4b-it-q8_0가 지금까지 실험으로 확정한 baseline 모델이다 — poc/eval-results.md 참고.
+const DEFAULT_MODELS = ["gemma3:4b-it-q8_0"];
 const DEFAULT_LIMIT = 50;
 
 // 로컬 모델은 JSON Schema로 형식을 유도해도 가끔(모델에 따라 10%대 확률로) JSON
@@ -674,9 +684,11 @@ function printComparisonTable(allStats: ModelStats[]) {
 async function main() {
   const models = process.argv[2] ? process.argv[2].split(",") : DEFAULT_MODELS;
   const limit = process.argv[3] ? Number(process.argv[3]) : DEFAULT_LIMIT;
-  const cases = TEST_CASES.slice(0, limit);
+  const cases = DATASET.slice(0, limit);
 
-  console.log(`모델 ${models.length}개 x 케이스 ${cases.length}개 비교 시작: ${models.join(", ")}`);
+  console.log(
+    `모델 ${models.length}개 x 케이스 ${cases.length}개 비교 시작 (데이터셋: ${DATASET.length}개): ${models.join(", ")}`,
+  );
 
   const allStats: ModelStats[] = [];
   for (const model of models) {
