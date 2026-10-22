@@ -70,6 +70,21 @@ const CATEGORY_KO_TO_EN: Record<string, Category> = {
   활동: "ACTIVITY",
 };
 
+/** category confusion matrix를 한글로 보기 좋게 찍기 위한 역매핑(평가 코드 전용). */
+const CATEGORY_EN_TO_KO: Record<Category, string> = {
+  FOOD: "음식",
+  PLACE: "장소",
+  OBJECT: "사물",
+  NATURE: "자연",
+  ANIMAL: "동물",
+  ACTIVITY: "활동",
+  PERSON: "사람",
+  EMOTION_REACTION: "감정반응",
+  SENSORY: "감각",
+  GENERIC: "일반",
+  OTHER: "기타",
+};
+
 interface OllamaChatResponse {
   message: { content: string };
   prompt_eval_count?: number;
@@ -121,6 +136,28 @@ async function unloadModel(model: string) {
   });
 }
 
+/**
+ * 평가 코드 전용 계측값 — 파이프라인(모델 호출/재시도 로직)은 그대로 두고,
+ * 호출마다 "성공/실패/재시도" 여부만 옆에서 집계한다.
+ */
+interface StageCallStats {
+  totalCalls: number;
+  validCalls: number;
+  retries: number;
+  finalFailures: number;
+}
+
+function newStageCallStats(): StageCallStats {
+  return { totalCalls: 0, validCalls: 0, retries: 0, finalFailures: 0 };
+}
+
+interface StageCallStatsBundle {
+  stage1: StageCallStats;
+  stage2: StageCallStats;
+  stage25: StageCallStats;
+  stage3: StageCallStats;
+}
+
 /** 세 단계가 공유하는 "JSON Schema로 유도 + Zod로 검증 + 실패 시 재시도" 루프. */
 async function callWithRetry<S extends z.ZodTypeAny>(
   model: string,
@@ -129,10 +166,13 @@ async function callWithRetry<S extends z.ZodTypeAny>(
   jsonSchema: object,
   userContent: string,
   zodSchema: S,
+  callStats: StageCallStats,
 ): Promise<{ data: z.infer<S>; response: OllamaChatResponse; schemaFailures: number }> {
   let lastRawContent = "";
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    callStats.totalCalls++;
+    if (attempt > 1) callStats.retries++;
     const response = await callOllama(model, systemPrompt, jsonSchema, userContent);
     lastRawContent = response.message.content;
 
@@ -145,10 +185,12 @@ async function callWithRetry<S extends z.ZodTypeAny>(
 
     const parsed = zodSchema.safeParse(json);
     if (parsed.success) {
+      callStats.validCalls++;
       return { data: parsed.data, response, schemaFailures: attempt - 1 };
     }
   }
 
+  callStats.finalFailures++;
   console.log(`  [${model}/${stageLabel}] ${MAX_ATTEMPTS}회 모두 실패한 마지막 원본 응답:\n${lastRawContent}`);
   throw new Error(`[${stageLabel}] ${MAX_ATTEMPTS}회 모두 실패했다`);
 }
@@ -473,22 +515,55 @@ interface FinalItem {
   uniqueness: (typeof UNIQUENESS_LEVELS)[number];
 }
 
+/** 평가 코드 전용 — 단계별 소요시간(ms). 2.5단계를 안 돌린 케이스는 0. */
+interface StageTiming {
+  stage1: number;
+  stage2: number;
+  stage25: number;
+  stage3: number;
+  total: number;
+}
+
+/** 평가 코드 전용 — 2.5단계에 들어간 ACTIVITY 후보별 판정 기록. */
+interface ActivityVerdictRecord {
+  name: string;
+  category: Category;
+  result: "COLLECTIBLE" | "NOT_COLLECTIBLE";
+}
+
 interface PipelineResult {
   items: FinalItem[];
   schemaFailures: number;
   totalPromptTokens: number;
   totalOutputTokens: number;
   totalDurationMs: number;
+  // 아래는 평가 코드가 단계별 지표(Candidate Recall/Category Accuracy/
+  // Collectibility/Latency)를 계산하기 위해 추가로 기록하는 중간 산출물이다.
+  // 파이프라인이 실제로 만들어내는 값을 그대로 노출할 뿐, 후처리로 보정하지 않는다.
+  candidates: { name: string; evidence: string }[];
+  classified: { name: string; evidence: string; category: Category }[];
+  activityVerdicts: ActivityVerdictRecord[];
+  timing: StageTiming;
+  failedStage: "1단계" | "2단계" | "2.5단계" | "3단계" | null;
 }
 
-/** 1단계(후보추출) → 2단계(분류) → 3단계(구체화)를 순서대로 실행한다. */
-async function extractPipeline(model: string, memo: string): Promise<PipelineResult> {
+/** 1단계(후보추출) → 2단계(분류) → 2.5단계(활동 판정) → 3단계(구체화)를 순서대로 실행한다. */
+async function extractPipeline(
+  model: string,
+  memo: string,
+  callStats: StageCallStatsBundle,
+): Promise<PipelineResult> {
   const result: PipelineResult = {
     items: [],
     schemaFailures: 0,
     totalPromptTokens: 0,
     totalOutputTokens: 0,
     totalDurationMs: 0,
+    candidates: [],
+    classified: [],
+    activityVerdicts: [],
+    timing: { stage1: 0, stage2: 0, stage25: 0, stage3: 0, total: 0 },
+    failedStage: null,
   };
   const track = (response: OllamaChatResponse, schemaFailures: number) => {
     result.schemaFailures += schemaFailures;
@@ -497,28 +572,54 @@ async function extractPipeline(model: string, memo: string): Promise<PipelineRes
     result.totalDurationMs += (response.total_duration ?? 0) / 1_000_000;
   };
 
-  const stage1 = await callWithRetry(
-    model,
-    "1단계",
-    CANDIDATE_SYSTEM_PROMPT,
-    CANDIDATE_JSON_SCHEMA,
-    memo,
-    CandidateResult,
-  );
+  const t1 = Date.now();
+  let stage1: Awaited<ReturnType<typeof callWithRetry<typeof CandidateResult>>>;
+  try {
+    stage1 = await callWithRetry(
+      model,
+      "1단계",
+      CANDIDATE_SYSTEM_PROMPT,
+      CANDIDATE_JSON_SCHEMA,
+      memo,
+      CandidateResult,
+      callStats.stage1,
+    );
+  } catch {
+    result.timing.stage1 = Date.now() - t1;
+    result.timing.total = result.timing.stage1;
+    result.failedStage = "1단계";
+    return result;
+  }
+  result.timing.stage1 = Date.now() - t1;
   track(stage1.response, stage1.schemaFailures);
+  result.candidates = stage1.data.candidates;
+
   if (stage1.data.candidates.length === 0) {
+    result.timing.total = result.timing.stage1;
     return result;
   }
 
-  const stage2 = await callWithRetry(
-    model,
-    "2단계",
-    CLASSIFY_SYSTEM_PROMPT,
-    CLASSIFY_JSON_SCHEMA,
-    JSON.stringify({ candidates: stage1.data.candidates }),
-    ClassifyResult,
-  );
+  const t2 = Date.now();
+  let stage2: Awaited<ReturnType<typeof callWithRetry<typeof ClassifyResult>>>;
+  try {
+    stage2 = await callWithRetry(
+      model,
+      "2단계",
+      CLASSIFY_SYSTEM_PROMPT,
+      CLASSIFY_JSON_SCHEMA,
+      JSON.stringify({ candidates: stage1.data.candidates }),
+      ClassifyResult,
+      callStats.stage2,
+    );
+  } catch {
+    result.timing.stage2 = Date.now() - t2;
+    result.timing.total = result.timing.stage1 + result.timing.stage2;
+    result.failedStage = "2단계";
+    return result;
+  }
+  result.timing.stage2 = Date.now() - t2;
   track(stage2.response, stage2.schemaFailures);
+  result.classified = stage2.data.items;
 
   const kept = stage2.data.items.filter((item) => KEEP_CATEGORIES.has(item.category));
   const activityCandidates = kept.filter((item) => item.category === "ACTIVITY");
@@ -526,18 +627,34 @@ async function extractPipeline(model: string, memo: string): Promise<PipelineRes
 
   let collectibleActivities: typeof activityCandidates = [];
   if (activityCandidates.length > 0) {
-    const stage2_5 = await callWithRetry(
-      model,
-      "2.5단계",
-      ACTIVITY_FILTER_SYSTEM_PROMPT,
-      ACTIVITY_FILTER_JSON_SCHEMA,
-      JSON.stringify({
-        memo,
-        activities: activityCandidates.map(({ name, evidence }) => ({ name, evidence })),
-      }),
-      ActivityFilterResult,
-    );
+    const t25 = Date.now();
+    let stage2_5: Awaited<ReturnType<typeof callWithRetry<typeof ActivityFilterResult>>>;
+    try {
+      stage2_5 = await callWithRetry(
+        model,
+        "2.5단계",
+        ACTIVITY_FILTER_SYSTEM_PROMPT,
+        ACTIVITY_FILTER_JSON_SCHEMA,
+        JSON.stringify({
+          memo,
+          activities: activityCandidates.map(({ name, evidence }) => ({ name, evidence })),
+        }),
+        ActivityFilterResult,
+        callStats.stage25,
+      );
+    } catch {
+      result.timing.stage25 = Date.now() - t25;
+      result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25;
+      result.failedStage = "2.5단계";
+      return result;
+    }
+    result.timing.stage25 = Date.now() - t25;
     track(stage2_5.response, stage2_5.schemaFailures);
+    result.activityVerdicts = activityCandidates.map((item) => ({
+      name: item.name,
+      category: item.category,
+      result: stage2_5.data.activities.find((v) => v.name === item.name)?.result ?? "NOT_COLLECTIBLE",
+    }));
     const collectibleNames = new Set(
       stage2_5.data.activities.filter((v) => v.result === "COLLECTIBLE").map((v) => v.name),
     );
@@ -546,30 +663,62 @@ async function extractPipeline(model: string, memo: string): Promise<PipelineRes
 
   const finalKept = [...nonActivityKept, ...collectibleActivities];
   if (finalKept.length === 0) {
+    result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25;
     return result;
   }
 
-  const stage3 = await callWithRetry(
-    model,
-    "3단계",
-    ENRICH_SYSTEM_PROMPT,
-    ENRICH_JSON_SCHEMA,
-    JSON.stringify({ items: finalKept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
-    EnrichResult,
-  );
+  const t3 = Date.now();
+  let stage3: Awaited<ReturnType<typeof callWithRetry<typeof EnrichResult>>>;
+  try {
+    stage3 = await callWithRetry(
+      model,
+      "3단계",
+      ENRICH_SYSTEM_PROMPT,
+      ENRICH_JSON_SCHEMA,
+      JSON.stringify({ items: finalKept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
+      EnrichResult,
+      callStats.stage3,
+    );
+  } catch {
+    result.timing.stage3 = Date.now() - t3;
+    result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.stage3;
+    result.failedStage = "3단계";
+    return result;
+  }
+  result.timing.stage3 = Date.now() - t3;
   track(stage3.response, stage3.schemaFailures);
 
   result.items = stage3.data.items;
+  result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.stage3;
   return result;
 }
 
-/** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치(한글→영어 매핑) + 이름 부분 포함(양방향). */
+/** 이름 부분 포함(양방향) — 모든 단계 평가에서 공통으로 쓰는 이름 매칭 규칙. */
+function namesOverlap(a: string, b: string): boolean {
+  return a.includes(b) || b.includes(a);
+}
+
+/** expected.name 또는 expected.aliases 중 하나라도 겹치면 매치로 본다. */
+function matchesExpectedName(actualName: string, expected: ExpectedItem): boolean {
+  const names = [expected.name, ...(expected.aliases ?? [])];
+  return names.some((n) => namesOverlap(actualName, n));
+}
+
+/** 정답 하나가 실제 추출 결과에 있는지: 카테고리 일치(한글→영어 매핑) + 이름 매칭(위 공통 규칙). */
 function isMatched(expected: ExpectedItem, actual: { name: string; category: string }[]) {
   const expectedCategory = CATEGORY_KO_TO_EN[expected.category] ?? expected.category;
-  const names = [expected.name, ...(expected.aliases ?? [])];
-  return actual.some(
-    (a) => a.category === expectedCategory && names.some((n) => a.name.includes(n) || n.includes(a.name)),
-  );
+  return actual.some((a) => a.category === expectedCategory && matchesExpectedName(a.name, expected));
+}
+
+function avg(nums: number[]): number {
+  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
+}
+
+function percentile(nums: number[], p: number): number {
+  if (nums.length === 0) return 0;
+  const sorted = [...nums].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
 }
 
 interface ModelStats {
@@ -584,6 +733,44 @@ interface ModelStats {
   totalOutputTokens: number;
   totalDurationMs: number;
   failures: { memo: string; expected: ExpectedItem[]; actual: string[] }[];
+
+  // --- 아래부터 확장 지표 (기존 지표는 위에서 그대로 유지) ---
+
+  // Precision/Recall/F1 (micro, 최종 아이템 vs expected)
+  tp: number;
+  fp: number;
+  fn: number;
+
+  // 1단계 Candidate Recall
+  candidateRecallHits: number;
+  candidateRecallTotal: number;
+  candidateRecallMisses: { memo: string; name: string; category: string }[];
+
+  // 2단계 Category Accuracy (1단계에서 발견된 expected candidate만 대상)
+  categoryCorrect: number;
+  categoryTotal: number;
+  categoryConfusion: Map<string, number>;
+
+  // 2.5단계 Collectibility
+  collectTp: number;
+  collectTn: number;
+  collectFp: number;
+  collectFn: number;
+
+  // 엣지케이스 실패 상세(최종 출력 아이템 포함)
+  failedEdgeCases: { memo: string; actual: string[] }[];
+
+  // 단계별 schema validation 호출 통계
+  stageCallStats: StageCallStatsBundle;
+
+  // 단계별 소요시간(ms) 분포 — 케이스마다 하나씩 push (2.5단계 미실행 시 0)
+  latencies: {
+    stage1: number[];
+    stage2: number[];
+    stage25: number[];
+    stage3: number[];
+    total: number[];
+  };
 }
 
 async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
@@ -599,58 +786,158 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
     totalOutputTokens: 0,
     totalDurationMs: 0,
     failures: [],
+    tp: 0,
+    fp: 0,
+    fn: 0,
+    candidateRecallHits: 0,
+    candidateRecallTotal: 0,
+    candidateRecallMisses: [],
+    categoryCorrect: 0,
+    categoryTotal: 0,
+    categoryConfusion: new Map(),
+    collectTp: 0,
+    collectTn: 0,
+    collectFp: 0,
+    collectFn: 0,
+    failedEdgeCases: [],
+    stageCallStats: {
+      stage1: newStageCallStats(),
+      stage2: newStageCallStats(),
+      stage25: newStageCallStats(),
+      stage3: newStageCallStats(),
+    },
+    latencies: { stage1: [], stage2: [], stage25: [], stage3: [], total: [] },
   };
 
   for (const [i, testCase] of cases.entries()) {
     process.stdout.write(`  [${model}] [${i + 1}/${cases.length}] `);
-    try {
-      const { items, schemaFailures, totalPromptTokens, totalOutputTokens, totalDurationMs } =
-        await extractPipeline(model, testCase.memo);
-      stats.schemaFailures += schemaFailures;
-      stats.totalPromptTokens += totalPromptTokens;
-      stats.totalOutputTokens += totalOutputTokens;
-      stats.totalDurationMs += totalDurationMs;
 
-      if (testCase.expected.length === 0) {
-        stats.edgeCaseTotal++;
-        const pass = items.length === 0;
-        if (pass) stats.edgeCasePassed++;
-        console.log(pass ? "엣지케이스 통과" : `엣지케이스 실패 (${items.length}개)`);
-        if (!pass) {
-          stats.failures.push({
-            memo: testCase.memo,
-            expected: [],
-            actual: items.map((it) => `${it.name}(${it.category})`),
-          });
-        }
+    const result = await extractPipeline(model, testCase.memo, stats.stageCallStats);
+    printCaseTrace(testCase.memo, result);
+
+    // 레이턴시는 실행된(혹은 실패로 중단된) 단계까지 그대로 기록한다 — 실행 안 된
+    // 단계는 extractPipeline이 이미 0으로 초기화해둔다.
+    stats.latencies.stage1.push(result.timing.stage1);
+    stats.latencies.stage2.push(result.timing.stage2);
+    stats.latencies.stage25.push(result.timing.stage25);
+    stats.latencies.stage3.push(result.timing.stage3);
+    stats.latencies.total.push(result.timing.total);
+
+    if (result.failedStage) {
+      stats.errorCount++;
+      console.log(`에러: ${result.failedStage} ${MAX_ATTEMPTS}회 모두 실패`);
+      stats.failures.push({ memo: testCase.memo, expected: testCase.expected, actual: ["(에러 발생)"] });
+      // 기존 동작과 동일하게, 에러 케이스는 Final Match Rate/엣지케이스/기타 지표
+      // 분모에서 전부 제외한다(실행이 끝까지 안 됐으니 "같은 실행 결과"가 아님).
+      continue;
+    }
+
+    stats.schemaFailures += result.schemaFailures;
+    stats.totalPromptTokens += result.totalPromptTokens;
+    stats.totalOutputTokens += result.totalOutputTokens;
+    stats.totalDurationMs += result.totalDurationMs;
+
+    const items = result.items;
+
+    // ---- 1단계 Candidate Recall + 2단계 Category Accuracy ----
+    // (1단계에서 못 찾은 expected item은 2단계 평가 대상에서 제외한다.)
+    for (const exp of testCase.expected) {
+      stats.candidateRecallTotal++;
+      const found = result.candidates.some((c) => matchesExpectedName(c.name, exp));
+      if (!found) {
+        stats.candidateRecallMisses.push({ memo: testCase.memo, name: exp.name, category: exp.category });
         continue;
       }
+      stats.candidateRecallHits++;
 
-      stats.totalExpected += testCase.expected.length;
-      let caseMatched = 0;
-      for (const exp of testCase.expected) {
-        if (isMatched(exp, items)) {
-          stats.matchedCount++;
-          caseMatched++;
-        }
+      stats.categoryTotal++;
+      const expectedCategoryEn = CATEGORY_KO_TO_EN[exp.category] ?? exp.category;
+      const classifiedHits = result.classified.filter((c) => matchesExpectedName(c.name, exp));
+      const correctHit = classifiedHits.find((c) => c.category === expectedCategoryEn);
+      if (correctHit) {
+        stats.categoryCorrect++;
+      } else if (classifiedHits.length > 0) {
+        const confusionKey = `${exp.category} → ${CATEGORY_EN_TO_KO[classifiedHits[0].category]}`;
+        stats.categoryConfusion.set(confusionKey, (stats.categoryConfusion.get(confusionKey) ?? 0) + 1);
       }
-      const pass = caseMatched === testCase.expected.length;
-      console.log(pass ? `통과 (${caseMatched}/${testCase.expected.length})` : `부분/실패 (${caseMatched}/${testCase.expected.length})`);
+    }
+
+    // ---- 2.5단계 Collectibility (ACTIVITY로 분류되어 2.5단계에 들어간 후보만) ----
+    for (const v of result.activityVerdicts) {
+      const matchesExpectedActivity = testCase.expected.some(
+        (exp) => exp.category === "활동" && matchesExpectedName(v.name, exp),
+      );
+      if (matchesExpectedActivity) {
+        if (v.result === "COLLECTIBLE") stats.collectTp++;
+        else stats.collectFn++;
+      } else if (v.result === "NOT_COLLECTIBLE") {
+        stats.collectTn++;
+      } else {
+        stats.collectFp++;
+      }
+    }
+
+    // ---- 엣지케이스 (기존 로직 그대로) + Precision/Recall용 FP ----
+    if (testCase.expected.length === 0) {
+      stats.edgeCaseTotal++;
+      const pass = items.length === 0;
+      if (pass) stats.edgeCasePassed++;
+      console.log(pass ? "엣지케이스 통과" : `엣지케이스 실패 (${items.length}개)`);
+      stats.fp += items.length; // expected가 없으니 나온 아이템은 전부 FP
       if (!pass) {
-        stats.failures.push({
-          memo: testCase.memo,
-          expected: testCase.expected,
-          actual: items.map((it) => `${it.name}(${it.category})`),
-        });
+        const actualStrs = items.map((it) => `${it.name}(${it.category})`);
+        stats.failedEdgeCases.push({ memo: testCase.memo, actual: actualStrs });
+        stats.failures.push({ memo: testCase.memo, expected: [], actual: actualStrs });
       }
-    } catch (err) {
-      stats.errorCount++;
-      console.log("에러:", (err as Error).message);
-      stats.failures.push({ memo: testCase.memo, expected: testCase.expected, actual: ["(에러 발생)"] });
+      continue;
+    }
+
+    // ---- 기존 Final Match Rate (그대로) + TP/FN/FP ----
+    stats.totalExpected += testCase.expected.length;
+    let caseMatched = 0;
+    for (const exp of testCase.expected) {
+      if (isMatched(exp, items)) {
+        stats.matchedCount++;
+        caseMatched++;
+        stats.tp++;
+      } else {
+        stats.fn++;
+      }
+    }
+    for (const it of items) {
+      const matchesSomeExpected = testCase.expected.some(
+        (exp) =>
+          it.category === (CATEGORY_KO_TO_EN[exp.category] ?? exp.category) && matchesExpectedName(it.name, exp),
+      );
+      if (!matchesSomeExpected) stats.fp++;
+    }
+
+    const pass = caseMatched === testCase.expected.length;
+    console.log(pass ? `통과 (${caseMatched}/${testCase.expected.length})` : `부분/실패 (${caseMatched}/${testCase.expected.length})`);
+    if (!pass) {
+      stats.failures.push({
+        memo: testCase.memo,
+        expected: testCase.expected,
+        actual: items.map((it) => `${it.name}(${it.category})`),
+      });
     }
   }
 
   return stats;
+}
+
+/** 케이스 하나의 단계별 원본 출력을 전부 찍는다(통과/실패 무관, 평가 코드 전용 로깅). */
+function printCaseTrace(memo: string, result: PipelineResult) {
+  console.log(`\n  메모: "${memo}"`);
+  console.log(`    1단계 candidates: ${JSON.stringify(result.candidates)}`);
+  console.log(`    2단계 classified: ${JSON.stringify(result.classified)}`);
+  if (result.activityVerdicts.length > 0) {
+    console.log(`    2.5단계 activityVerdicts: ${JSON.stringify(result.activityVerdicts)}`);
+  }
+  console.log(`    3단계 최종 items: ${JSON.stringify(result.items)}`);
+  if (result.failedStage) {
+    console.log(`    (주의: ${result.failedStage}에서 schema validation 최종 실패, 이후 단계 미실행)`);
+  }
 }
 
 function printModelReport(stats: ModelStats) {
@@ -681,6 +968,95 @@ function printComparisonTable(allStats: ModelStats[]) {
   }
 }
 
+/**
+ * 기존 Final Match Rate/엣지케이스 통과율 외에 추가로 수집한 확장 지표를 출력한다.
+ * Precision/Recall/F1, 단계별 Candidate Recall/Category Accuracy/Collectibility,
+ * schema validation 통계, 단계별 레이턴시 분포.
+ */
+function printExtendedMetrics(stats: ModelStats) {
+  console.log(`\n=== ${stats.model} 확장 평가 지표 ===`);
+
+  const precision = stats.tp + stats.fp > 0 ? stats.tp / (stats.tp + stats.fp) : 0;
+  const recall = stats.tp + stats.fn > 0 ? stats.tp / (stats.tp + stats.fn) : 0;
+  const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+  console.log(`\n[Precision / Recall / F1] (micro-average, 전체 케이스 TP/FP/FN 합산)`);
+  console.log(`  TP=${stats.tp}  FP=${stats.fp}  FN=${stats.fn}`);
+  console.log(
+    `  Precision=${(precision * 100).toFixed(1)}%  Recall=${(recall * 100).toFixed(1)}%  F1=${(f1 * 100).toFixed(1)}%`,
+  );
+
+  const candidateRecallPct = stats.candidateRecallTotal
+    ? (stats.candidateRecallHits / stats.candidateRecallTotal) * 100
+    : 0;
+  console.log(`\n[1단계 Candidate Recall]`);
+  console.log(
+    `  ${stats.candidateRecallHits}/${stats.candidateRecallTotal} (${candidateRecallPct.toFixed(1)}%), ` +
+      `누락 ${stats.candidateRecallMisses.length}건`,
+  );
+  for (const m of stats.candidateRecallMisses) {
+    console.log(`    - "${m.memo}" → 정답 "${m.name}(${m.category})" 후보에 없음`);
+  }
+
+  const categoryAccuracyPct = stats.categoryTotal ? (stats.categoryCorrect / stats.categoryTotal) * 100 : 0;
+  console.log(`\n[2단계 Category Accuracy] (1단계에서 발견된 expected candidate만 대상)`);
+  console.log(`  ${stats.categoryCorrect}/${stats.categoryTotal} (${categoryAccuracyPct.toFixed(1)}%)`);
+  if (stats.categoryConfusion.size > 0) {
+    console.log("  category confusion:");
+    const sorted = [...stats.categoryConfusion.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [pair, count] of sorted) {
+      console.log(`    - ${pair}: ${count}`);
+    }
+  }
+
+  const collectTotal = stats.collectTp + stats.collectTn + stats.collectFp + stats.collectFn;
+  const collectAccuracyPct = collectTotal ? ((stats.collectTp + stats.collectTn) / collectTotal) * 100 : 0;
+  console.log(`\n[2.5단계 Collectibility] (ACTIVITY로 분류되어 2.5단계에 들어간 후보만 대상)`);
+  console.log(
+    `  TP=${stats.collectTp}  TN=${stats.collectTn}  FP=${stats.collectFp}  FN=${stats.collectFn}  ` +
+      `accuracy=${collectAccuracyPct.toFixed(1)}%`,
+  );
+
+  console.log(`\n[엣지케이스 실패 상세] ${stats.failedEdgeCases.length}건`);
+  for (const f of stats.failedEdgeCases) {
+    console.log(`  - "${f.memo}" → ${f.actual.join(", ") || "(없음)"}`);
+  }
+
+  const { stage1, stage2, stage25, stage3 } = stats.stageCallStats;
+  const validRate = (s: StageCallStats) => (s.totalCalls ? (s.validCalls / s.totalCalls) * 100 : 0);
+  console.log(`\n[Schema Validation]`);
+  console.log(`  stage1 schema valid rate:   ${stage1.validCalls}/${stage1.totalCalls} (${validRate(stage1).toFixed(1)}%)`);
+  console.log(`  stage2 schema valid rate:   ${stage2.validCalls}/${stage2.totalCalls} (${validRate(stage2).toFixed(1)}%)`);
+  console.log(`  stage2.5 schema valid rate: ${stage25.validCalls}/${stage25.totalCalls} (${validRate(stage25).toFixed(1)}%)`);
+  console.log(`  stage3 schema valid rate:   ${stage3.validCalls}/${stage3.totalCalls} (${validRate(stage3).toFixed(1)}%)`);
+  const totalCalls = stage1.totalCalls + stage2.totalCalls + stage25.totalCalls + stage3.totalCalls;
+  const totalValid = stage1.validCalls + stage2.validCalls + stage25.validCalls + stage3.validCalls;
+  const totalRetries = stage1.retries + stage2.retries + stage25.retries + stage3.retries;
+  const totalFinalFailures =
+    stage1.finalFailures + stage2.finalFailures + stage25.finalFailures + stage3.finalFailures;
+  console.log(
+    `  전체 호출 수: ${totalCalls}  schema validation 실패 수: ${totalCalls - totalValid}  ` +
+      `retry 수: ${totalRetries}  최종 실패 수: ${totalFinalFailures}`,
+  );
+
+  const summarize = (nums: number[]) => ({
+    avg: avg(nums),
+    p50: percentile(nums, 50),
+    p95: percentile(nums, 95),
+    max: nums.length ? Math.max(...nums) : 0,
+  });
+  const l1 = summarize(stats.latencies.stage1);
+  const l2 = summarize(stats.latencies.stage2);
+  const l25 = summarize(stats.latencies.stage25);
+  const l3 = summarize(stats.latencies.stage3);
+  const lTotal = summarize(stats.latencies.total);
+  console.log(`\n[Latency (ms)]`);
+  console.log(`  Stage1   avg=${l1.avg.toFixed(0)}  p50=${l1.p50}  p95=${l1.p95}  max=${l1.max}`);
+  console.log(`  Stage2   avg=${l2.avg.toFixed(0)}  p50=${l2.p50}  p95=${l2.p95}  max=${l2.max}`);
+  console.log(`  Stage2.5 avg=${l25.avg.toFixed(0)}  p50=${l25.p50}  p95=${l25.p95}  max=${l25.max}`);
+  console.log(`  Stage3   avg=${l3.avg.toFixed(0)}  p50=${l3.p50}  p95=${l3.p95}  max=${l3.max}`);
+  console.log(`  Total    avg=${lTotal.avg.toFixed(0)}  p50=${lTotal.p50}  p95=${lTotal.p95}  max=${lTotal.max}`);
+}
+
 async function main() {
   const models = process.argv[2] ? process.argv[2].split(",") : DEFAULT_MODELS;
   const limit = process.argv[3] ? Number(process.argv[3]) : DEFAULT_LIMIT;
@@ -696,6 +1072,7 @@ async function main() {
     const stats = await runEval(model, cases);
     allStats.push(stats);
     printModelReport(stats);
+    printExtendedMetrics(stats);
     await unloadModel(model);
   }
 
