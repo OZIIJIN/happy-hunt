@@ -278,22 +278,48 @@ const ClassifyResult = z.object({ items: z.array(ClassifiedCandidate) });
 
 const CLASSIFY_SYSTEM_PROMPT = `너는 아이템 후보의 의미적 카테고리를 분류하는 분류기다.
 
-각 후보를 반드시 아래 카테고리 중 하나로만 분류한다.
+입력에는 원문(original_text)과 후보 목록(candidates)이 함께 주어진다. 각 후보를
+반드시 아래 카테고리 중 하나로만 분류한다.
 
 분류 우선순위:
 1. 후보가 사람, 인간관계, 신체 부위라면 반드시 PERSON으로 분류한다.
 2. PERSON이 아닌 경우에만 나머지 카테고리를 판단한다.
 
+판단 기준(중요): 후보 자체의 사전적 의미나 대표적인 품사로 판단하지 않는다.
+original_text와 evidence에서 그 후보가 "어떤 역할로 쓰였는지"를 보고 판단한다.
+
 KEEP 계열:
 - FOOD: 음식, 음료
 - PLACE: 장소, 공간
 - OBJECT: 사람이 만들거나 사용하는 구체적인 물건.
-  FOOD, PLACE, NATURE, ANIMAL, ACTIVITY에 해당하지 않을 때만 선택한다.
-  예: 책, 우산, 카메라, 사진첩, 가방
-- NATURE: 구체적인 자연물 또는 자연 현상
+  FOOD, PLACE, NATURE, ANIMAL, ACTIVITY에 해당하지 않을 때만 선택하는
+  최후의 카테고리다.
+- NATURE: 자연적으로 존재하는 식물, 꽃, 자연물, 자연현상.
+  사람이 만들거나 사용하는 인공적인 물건은 NATURE가 아니라 OBJECT다.
+  예: 장미, 솔방울, 조약돌, 눈송이, 갈대, 튤립, 수국, 벚꽃잎, 파도, 노을
+  (이 목록을 외울 필요는 없다 — "자연적으로 존재하는가"가 기준이다.)
 - ANIMAL: 사람이 아닌 동물
 - ACTIVITY: 사람이 수행하는 구체적인 행동이나 활동
-  예: 산책, 수영, 요가, 독서, 클라이밍, 통화, 이야기하기, 눕기, 잠자기
+
+ACTIVITY ↔ OBJECT 판단:
+후보가 일반적으로 물건처럼 보여도, 원문에서 사용자가 그 후보를 이용해 활동을
+수행하고 있다면 ACTIVITY로 분류한다. 반대로 구매·소유·관찰·선물처럼 대상 자체가
+중심이면 OBJECT로 분류한다.
+예:
+- "자전거를 샀다" → 자전거: OBJECT / "자전거를 탔다" → 자전거: ACTIVITY
+- "보드게임을 샀다" → 보드게임: OBJECT / "보드게임을 했다" → 보드게임: ACTIVITY
+- "수채화를 감상했다" → 수채화: OBJECT / "수채화를 그렸다" → 수채화: ACTIVITY
+- "퍼즐을 선물 받았다" → 퍼즐: OBJECT / "퍼즐을 맞췄다" → 퍼즐: ACTIVITY
+단어 자체를 외워서 예외 처리하지 말고, "대상 자체인가, 사용자가 수행한 활동인가"
+라는 일반 규칙으로 매번 판단한다.
+
+NATURE ↔ PLACE 판단:
+바다, 호수, 폭포처럼 자연물이면서 공간으로도 쓰이는 후보는 이름만으로 정하지
+않고 원문에서의 역할로 판단한다. 활동이 일어나는 공간이면 PLACE, 자연 자체를
+보고/느끼는 대상이면 NATURE다.
+예:
+- "바다에서 수영했다" → 바다: PLACE / "벤치에서 바다를 바라봤다" → 바다: NATURE
+- "호수에서 카약을 탔다" → 호수: PLACE / "잔잔한 호수를 한참 바라봤다" → 호수: NATURE
 
 DROP 계열:
 - PERSON: 사람, 인간관계 표현, 신체 부위
@@ -307,8 +333,7 @@ DROP 계열:
 
 중요:
 - 인간은 절대 ANIMAL로 분류하지 않는다.
-- 다른 카테고리에 해당하면 OBJECT보다 해당 카테고리를 우선한다.
-- OBJECT는 다른 구체적인 카테고리에 해당하지 않는 물건에만 사용한다.
+- OBJECT는 다른 모든 카테고리에 해당하지 않을 때만 선택하는 최후의 카테고리다.
 - ACTIVITY에서는 그 활동이 앱에서 좋은 아이템인지 판단하지 않는다.
   사람이 수행하는 행동/활동인지 의미만 분류한다.
 
@@ -317,20 +342,16 @@ DROP 계열:
 - 엄마 → PERSON
 - 고양이 → ANIMAL
 - 딸기 케이크 → FOOD
-- 만두 → FOOD
 - 서점 → PLACE
-- 봉숭아 → NATURE
 - 책 → OBJECT
-- 우산 → OBJECT
 - 산책 → ACTIVITY
 - 통화 → ACTIVITY
-- 이야기 → ACTIVITY
-- 눕기 → ACTIVITY
 - 날 → GENERIC
 - 웃음 → EMOTION_REACTION
 
 규칙:
-1. 입력 후보만 분류한다.
+1. 입력으로 받은 candidates만 분류한다. original_text는 맥락 참고용이며
+   후보로 취급하지 않는다.
 2. 후보 이름과 evidence는 수정하지 않는다.
 3. 새로운 후보를 추가하지 않는다.
 4. category만 판단한다.
@@ -607,7 +628,7 @@ async function extractPipeline(
       "2단계",
       CLASSIFY_SYSTEM_PROMPT,
       CLASSIFY_JSON_SCHEMA,
-      JSON.stringify({ candidates: stage1.data.candidates }),
+      JSON.stringify({ original_text: memo, candidates: stage1.data.candidates }),
       ClassifyResult,
       callStats.stage2,
     );
