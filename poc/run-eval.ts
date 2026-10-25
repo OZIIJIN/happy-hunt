@@ -2,9 +2,10 @@
  * test-memos.ts의 TEST_CASES(정답 포함)를 여러 로컬 모델로 돌려서
  * 정확도/속도를 비교한다.
  *
- * extract-items.ts와 추출 로직(3단계 파이프라인: 후보추출 → 분류 → 구체화)은
+ * extract-items.ts와 추출 로직(후보추출 → 분류 → 활동판정 → Final Selector → 구체화)은
  * 동일하게 맞췄다 — 이 파일은 그 위에 "정답과 비교해서 채점 + 모델간 비교"를
- * 추가한 버전이다. 3단계 세부 설계 이유는 extract-items.ts 헤더 주석 참고.
+ * 추가한 버전이다. 단계별 세부 설계 이유는 extract-items.ts 헤더 주석 참고.
+ * FINAL_SELECTOR=off를 주면 Final Selector 없이 baseline 파이프라인으로 돈다.
  *
  * test-memos.ts의 정답 카테고리는 한글(음식/장소/자연/사물/동물/활동)이고 파이프라인의
  * 최종 카테고리는 영어(FOOD/PLACE/...)라 CATEGORY_KO_TO_EN으로 채점 시에만 매핑한다.
@@ -25,6 +26,13 @@ import { TEST_CASES as TEST_CASES_500, type ExpectedItem, type TestCase } from "
 import { TEST_CASES as TEST_CASES_100 } from "./test-memos-100.ts";
 
 const DATASET = process.env.TEST_SET === "100" ? TEST_CASES_100 : TEST_CASES_500;
+
+// FINAL_SELECTOR=off를 주면 Final Selector 없이 baseline 파이프라인 그대로 돈다
+// (Selector 입력 후보가 그대로 3단계로 넘어감) — baseline 재현/비교용.
+const FINAL_SELECTOR_ENABLED = process.env.FINAL_SELECTOR !== "off";
+
+// Final Selector 실험의 비교 기준 — Selector 도입 직전 baseline(100케이스) 수치.
+const BASELINE_PRF = { precision: 48.4, recall: 80.2, f1: 60.4 };
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST ?? "http://localhost:11434";
 
@@ -155,6 +163,7 @@ interface StageCallStatsBundle {
   stage1: StageCallStats;
   stage2: StageCallStats;
   stage25: StageCallStats;
+  finalSelector: StageCallStats;
   stage3: StageCallStats;
 }
 
@@ -432,8 +441,128 @@ NOT_COLLECTIBLE:
 5. 반드시 JSON만 출력한다.`;
 
 // ============================================================
+// Final Selector — 2단계(ACTIVITY 제외 KEEP 카테고리) + 2.5단계(COLLECTIBLE)를
+// 통과한 후보 전체를 한 번에 비교해서, 그 행복 순간을 대표할 수집 아이템만 고른다.
+// 1단계는 recall 우선이라 후보를 넓게 뽑고 2단계 KEEP은 대부분 끝까지 살아남아서,
+// 원문엔 있지만 주변적인 후보가 최종 결과에 많이 섞인다 — 그걸 줄이는 단계다.
+// 새 후보 생성/이름·category·evidence 수정은 하지 않고 id 선택만 시킨다
+// (선택된 id로 기존 candidate 객체를 그대로 필터링해서 3단계로 넘긴다).
+// ============================================================
+
+interface SelectorCandidate {
+  id: number;
+  name: string;
+  category: Category;
+  evidence: string;
+}
+
+/**
+ * Final Selector 스키마는 입력 후보 id 집합에 따라 달라서 호출마다 만든다.
+ * JSON Schema enum으로 입력 id만 고르도록 유도하고, Zod에서 "입력에 없는 id"와
+ * "중복 id"를 다시 검증해 invalid output으로 처리한다(→ 재시도).
+ */
+function finalSelectorSchemas(ids: number[]) {
+  const idSet = new Set(ids);
+  const jsonSchema = {
+    type: "object",
+    properties: {
+      selected_ids: { type: "array", items: { type: "integer", enum: ids } },
+    },
+    required: ["selected_ids"],
+  };
+  const zodSchema = z.object({ selected_ids: z.array(z.number().int()) }).superRefine((value, ctx) => {
+    if (new Set(value.selected_ids).size !== value.selected_ids.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "selected_ids에 중복 id가 있다" });
+    }
+    const unknownIds = value.selected_ids.filter((id) => !idSet.has(id));
+    if (unknownIds.length > 0) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `입력에 없는 id: ${unknownIds.join(", ")}` });
+    }
+  });
+  return { jsonSchema, zodSchema };
+}
+
+const FINAL_SELECTOR_SYSTEM_PROMPT = `너는 사용자의 행복한 순간에서 최종적으로 수집할 아이템을 선택하는 역할이다.
+
+입력에는 원문과 이미 추출·분류된 후보들이 주어진다.
+
+후보를 새로 만들지 말고, 주어진 후보 중 실제 수집 아이템으로 적절한 것만 선택하라.
+
+다음 네 기준을 함께 고려한다.
+
+1. 관련성
+- 해당 후보가 이 행복한 순간에서 의미 있는 요소인가?
+- 단순히 문장에 등장했을 뿐인 배경이나 주변 요소는 제외한다.
+
+2. 구체성
+- 독립적인 아이템으로 표현할 만큼 구체적인가?
+- "하루", "곳", "한 잔", "조각"처럼 문맥 없이는 의미가 약한 표현은 제외한다.
+
+3. 근거성
+- 원문과 evidence에서 해당 후보가 명확하게 확인되는가?
+- 원문의 일부를 잘못 잘라 만들어진 후보는 제외한다.
+
+4. 수집 가치
+- 이 아이템을 아이콘으로 받아 나중에 봤을 때 해당 행복한 순간을 떠올리기 좋은가?
+- 단순 배경, 상태, 부수 행동보다 그 순간을 대표하는 구체적인 대상이나 경험을 우선한다.
+
+추가 규칙:
+- 후보 전체를 서로 비교해서 판단한다.
+- 같은 의미를 중복해서 나타내는 후보가 여러 개라면 가장 구체적이고 대표적인 하나만 선택한다.
+- 여러 후보가 각각 독립적으로 그 순간을 잘 대표한다면 여러 개를 선택할 수 있다.
+- 억지로 하나 이상 선택할 필요는 없다.
+- 카테고리가 무엇인지보다 실제 순간을 대표하는지가 더 중요하다.
+- 새로운 아이템을 만들지 않고, 입력에 있는 id만 selected_ids로 반환한다.
+- 선택할 아이템이 없다면 selected_ids를 빈 배열로 반환한다.
+- 반드시 지정된 JSON 형식으로만 응답한다.
+
+예 1:
+원문: "베란다에 누워 쏟아지는 유성우를 한참 바라봤다."
+후보:
+[
+  {"id":1,"name":"베란다","category":"PLACE","evidence":"베란다에 누워"},
+  {"id":2,"name":"유성우","category":"NATURE","evidence":"쏟아지는 유성우"},
+  {"id":3,"name":"유성","category":"NATURE","evidence":"유성우를"}
+]
+결과: {"selected_ids":[2]}
+(유성우가 순간을 가장 잘 대표하며 유성은 중복이고 베란다는 배경에 가깝다.)
+
+예 2:
+원문: "주말 장터에서 산 따끈한 꽈배기를 손난로를 쥔 채 호호 불며 먹었다."
+후보:
+[
+  {"id":1,"name":"장터","category":"PLACE","evidence":"주말 장터에서"},
+  {"id":2,"name":"꽈배기","category":"FOOD","evidence":"따끈한 꽈배기"},
+  {"id":3,"name":"손난로","category":"OBJECT","evidence":"손난로를 쥔 채"}
+]
+결과: {"selected_ids":[2,3]}
+(꽈배기와 손난로는 해당 순간을 기억하게 하는 핵심 요소이고, 장터는 상대적으로 배경 역할이다.)
+
+예 3:
+원문: "할아버지가 손수 담그신 수정과에 인절미 한 조각을 곁들였다."
+후보:
+[
+  {"id":1,"name":"수정과","category":"FOOD","evidence":"수정과"},
+  {"id":2,"name":"인절미","category":"FOOD","evidence":"인절미"},
+  {"id":3,"name":"손수","category":"OBJECT","evidence":"손수"},
+  {"id":4,"name":"한 조각","category":"OBJECT","evidence":"한 조각"}
+]
+결과: {"selected_ids":[1,2]}
+
+예 4:
+원문: "출장길에 우연히 들른 작은 문방구에서 어릴 적 추억에 빠졌다."
+후보:
+[
+  {"id":1,"name":"출장","category":"ACTIVITY","evidence":"출장길에"},
+  {"id":2,"name":"문방구","category":"PLACE","evidence":"작은 문방구에서"}
+]
+결과: {"selected_ids":[2]}
+(문방구 자체가 이 행복한 순간의 핵심 경험이므로 PLACE라도 선택한다.)`;
+
+// ============================================================
 // 3단계 — Item Enrichment: 2단계(ACTIVITY 제외 KEEP 카테고리) + 2.5단계
 // (COLLECTIBLE로 판정된 ACTIVITY)를 통과한 최종 아이템만 구체화한다.
+// (Final Selector가 켜져 있으면 그중 Selector가 선택한 후보만 들어온다.)
 // ============================================================
 
 const ENRICH_JSON_SCHEMA = {
@@ -515,11 +644,12 @@ interface FinalItem {
   uniqueness: (typeof UNIQUENESS_LEVELS)[number];
 }
 
-/** 평가 코드 전용 — 단계별 소요시간(ms). 2.5단계를 안 돌린 케이스는 0. */
+/** 평가 코드 전용 — 단계별 소요시간(ms). 2.5단계/Final Selector를 안 돌린 케이스는 0. */
 interface StageTiming {
   stage1: number;
   stage2: number;
   stage25: number;
+  finalSelector: number;
   stage3: number;
   total: number;
 }
@@ -543,11 +673,18 @@ interface PipelineResult {
   candidates: { name: string; evidence: string }[];
   classified: { name: string; evidence: string; category: Category }[];
   activityVerdicts: ActivityVerdictRecord[];
+  // Final Selector에 들어간 후보(id 부여)와 선택된 id. Selector가 꺼져 있으면
+  // 입력 전체가 선택된 것으로 기록한다.
+  selectorInput: SelectorCandidate[];
+  selectedIds: number[];
   timing: StageTiming;
-  failedStage: "1단계" | "2단계" | "2.5단계" | "3단계" | null;
+  failedStage: "1단계" | "2단계" | "2.5단계" | "Final Selector" | "3단계" | null;
 }
 
-/** 1단계(후보추출) → 2단계(분류) → 2.5단계(활동 판정) → 3단계(구체화)를 순서대로 실행한다. */
+/**
+ * 1단계(후보추출) → 2단계(분류) → 2.5단계(활동 판정) → Final Selector(최종 선택)
+ * → 3단계(구체화)를 순서대로 실행한다.
+ */
 async function extractPipeline(
   model: string,
   memo: string,
@@ -562,7 +699,9 @@ async function extractPipeline(
     candidates: [],
     classified: [],
     activityVerdicts: [],
-    timing: { stage1: 0, stage2: 0, stage25: 0, stage3: 0, total: 0 },
+    selectorInput: [],
+    selectedIds: [],
+    timing: { stage1: 0, stage2: 0, stage25: 0, finalSelector: 0, stage3: 0, total: 0 },
     failedStage: null,
   };
   const track = (response: OllamaChatResponse, schemaFailures: number) => {
@@ -667,6 +806,41 @@ async function extractPipeline(
     return result;
   }
 
+  result.selectorInput = finalKept.map(({ name, category, evidence }, i) => ({ id: i + 1, name, category, evidence }));
+  let selected = result.selectorInput;
+  if (FINAL_SELECTOR_ENABLED) {
+    const { jsonSchema, zodSchema } = finalSelectorSchemas(result.selectorInput.map((c) => c.id));
+    const tfs = Date.now();
+    let finalSelector: Awaited<ReturnType<typeof callWithRetry<typeof zodSchema>>>;
+    try {
+      finalSelector = await callWithRetry(
+        model,
+        "Final Selector",
+        FINAL_SELECTOR_SYSTEM_PROMPT,
+        jsonSchema,
+        JSON.stringify({ original_text: memo, candidates: result.selectorInput }),
+        zodSchema,
+        callStats.finalSelector,
+      );
+    } catch {
+      result.timing.finalSelector = Date.now() - tfs;
+      result.timing.total =
+        result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.finalSelector;
+      result.failedStage = "Final Selector";
+      return result;
+    }
+    result.timing.finalSelector = Date.now() - tfs;
+    track(finalSelector.response, finalSelector.schemaFailures);
+    const selectedIdSet = new Set(finalSelector.data.selected_ids);
+    selected = result.selectorInput.filter((c) => selectedIdSet.has(c.id));
+  }
+  result.selectedIds = selected.map((c) => c.id);
+  if (selected.length === 0) {
+    result.timing.total =
+      result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.finalSelector;
+    return result;
+  }
+
   const t3 = Date.now();
   let stage3: Awaited<ReturnType<typeof callWithRetry<typeof EnrichResult>>>;
   try {
@@ -675,13 +849,18 @@ async function extractPipeline(
       "3단계",
       ENRICH_SYSTEM_PROMPT,
       ENRICH_JSON_SCHEMA,
-      JSON.stringify({ items: finalKept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
+      JSON.stringify({ items: selected.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
       EnrichResult,
       callStats.stage3,
     );
   } catch {
     result.timing.stage3 = Date.now() - t3;
-    result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.stage3;
+    result.timing.total =
+      result.timing.stage1 +
+      result.timing.stage2 +
+      result.timing.stage25 +
+      result.timing.finalSelector +
+      result.timing.stage3;
     result.failedStage = "3단계";
     return result;
   }
@@ -689,7 +868,12 @@ async function extractPipeline(
   track(stage3.response, stage3.schemaFailures);
 
   result.items = stage3.data.items;
-  result.timing.total = result.timing.stage1 + result.timing.stage2 + result.timing.stage25 + result.timing.stage3;
+  result.timing.total =
+    result.timing.stage1 +
+    result.timing.stage2 +
+    result.timing.stage25 +
+    result.timing.finalSelector +
+    result.timing.stage3;
   return result;
 }
 
@@ -732,7 +916,7 @@ interface ModelStats {
   totalPromptTokens: number;
   totalOutputTokens: number;
   totalDurationMs: number;
-  failures: { memo: string; expected: ExpectedItem[]; actual: string[] }[];
+  failures: { memo: string; expected: ExpectedItem[]; actual: string[]; selectorDropped?: string[] }[];
 
   // --- 아래부터 확장 지표 (기존 지표는 위에서 그대로 유지) ---
 
@@ -760,17 +944,44 @@ interface ModelStats {
   // 엣지케이스 실패 상세(최종 출력 아이템 포함)
   failedEdgeCases: { memo: string; actual: string[] }[];
 
+  // Final Selector — 에러 없이 끝난 케이스 기준. 입력이 0개라 Selector를 안 돌린
+  // 케이스도 "케이스당 평균"의 분모에는 포함한다.
+  selectorEvaluatedCases: number;
+  selectorRanCases: number;
+  selectorInputTotal: number;
+  selectorSelectedTotal: number;
+  // 매칭은 최종 채점과 같은 규칙(category 일치 + 이름 매칭)을 쓴다.
+  selectorExpectedInInput: number;
+  selectorExpectedPreserved: number;
+  selectorNonExpectedInInput: number;
+  selectorNonExpectedRemoved: number;
+  selectorDroppedExpected: { memo: string; expected: string; candidates: string[] }[];
+  // 같은 실행에서 Selector 입력을 그대로 최종 결과로 봤을 때의 TP/FP/FN —
+  // "Selector 미적용" 가정치(3단계는 name/category를 바꾸지 않으므로 baseline에 대응).
+  preSelectorTp: number;
+  preSelectorFp: number;
+  preSelectorFn: number;
+  // 엣지케이스 중 Selector 입력엔 후보가 있었는데 Selector가 전부 제거한 케이스 수
+  edgeCasesClearedBySelector: number;
+
   // 단계별 schema validation 호출 통계
   stageCallStats: StageCallStatsBundle;
 
-  // 단계별 소요시간(ms) 분포 — 케이스마다 하나씩 push (2.5단계 미실행 시 0)
+  // 단계별 소요시간(ms) 분포 — 케이스마다 하나씩 push (2.5단계/Final Selector 미실행 시 0)
   latencies: {
     stage1: number[];
     stage2: number[];
     stage25: number[];
+    finalSelector: number[];
     stage3: number[];
     total: number[];
   };
+}
+
+/** 최종 채점과 같은 규칙: category 일치(한글→영어 매핑) + 이름 매칭. */
+function matchesExpectedItem(actual: { name: string; category: string }, expected: ExpectedItem): boolean {
+  const expectedCategory = CATEGORY_KO_TO_EN[expected.category] ?? expected.category;
+  return actual.category === expectedCategory && matchesExpectedName(actual.name, expected);
 }
 
 async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
@@ -800,13 +1011,27 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
     collectFp: 0,
     collectFn: 0,
     failedEdgeCases: [],
+    selectorEvaluatedCases: 0,
+    selectorRanCases: 0,
+    selectorInputTotal: 0,
+    selectorSelectedTotal: 0,
+    selectorExpectedInInput: 0,
+    selectorExpectedPreserved: 0,
+    selectorNonExpectedInInput: 0,
+    selectorNonExpectedRemoved: 0,
+    selectorDroppedExpected: [],
+    preSelectorTp: 0,
+    preSelectorFp: 0,
+    preSelectorFn: 0,
+    edgeCasesClearedBySelector: 0,
     stageCallStats: {
       stage1: newStageCallStats(),
       stage2: newStageCallStats(),
       stage25: newStageCallStats(),
+      finalSelector: newStageCallStats(),
       stage3: newStageCallStats(),
     },
-    latencies: { stage1: [], stage2: [], stage25: [], stage3: [], total: [] },
+    latencies: { stage1: [], stage2: [], stage25: [], finalSelector: [], stage3: [], total: [] },
   };
 
   for (const [i, testCase] of cases.entries()) {
@@ -820,6 +1045,7 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
     stats.latencies.stage1.push(result.timing.stage1);
     stats.latencies.stage2.push(result.timing.stage2);
     stats.latencies.stage25.push(result.timing.stage25);
+    stats.latencies.finalSelector.push(result.timing.finalSelector);
     stats.latencies.stage3.push(result.timing.stage3);
     stats.latencies.total.push(result.timing.total);
 
@@ -877,12 +1103,48 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
       }
     }
 
+    // ---- Final Selector (Selector 입력 vs 선택 결과) ----
+    const selectedIdSet = new Set(result.selectedIds);
+    const selectedCandidates = result.selectorInput.filter((c) => selectedIdSet.has(c.id));
+    stats.selectorEvaluatedCases++;
+    if (result.selectorInput.length > 0) stats.selectorRanCases++;
+    stats.selectorInputTotal += result.selectorInput.length;
+    stats.selectorSelectedTotal += selectedCandidates.length;
+    const selectorDropped: string[] = [];
+    for (const exp of testCase.expected) {
+      const inInput = result.selectorInput.filter((c) => matchesExpectedItem(c, exp));
+      if (inInput.length === 0) {
+        stats.preSelectorFn++;
+        continue;
+      }
+      stats.preSelectorTp++;
+      stats.selectorExpectedInInput++;
+      if (selectedCandidates.some((c) => matchesExpectedItem(c, exp))) {
+        stats.selectorExpectedPreserved++;
+      } else {
+        const expStr = `${exp.name}(${exp.category})`;
+        selectorDropped.push(expStr);
+        stats.selectorDroppedExpected.push({
+          memo: testCase.memo,
+          expected: expStr,
+          candidates: inInput.map((c) => `#${c.id} ${c.name}(${c.category})`),
+        });
+      }
+    }
+    for (const c of result.selectorInput) {
+      if (testCase.expected.some((exp) => matchesExpectedItem(c, exp))) continue;
+      stats.preSelectorFp++;
+      stats.selectorNonExpectedInInput++;
+      if (!selectedIdSet.has(c.id)) stats.selectorNonExpectedRemoved++;
+    }
+
     // ---- 엣지케이스 (기존 로직 그대로) + Precision/Recall용 FP ----
     if (testCase.expected.length === 0) {
       stats.edgeCaseTotal++;
       const pass = items.length === 0;
       if (pass) stats.edgeCasePassed++;
-      console.log(pass ? "엣지케이스 통과" : `엣지케이스 실패 (${items.length}개)`);
+      if (result.selectorInput.length > 0 && selectedCandidates.length === 0) stats.edgeCasesClearedBySelector++;
+      console.log(pass ? "    평가 결과: 엣지케이스 통과" : `    평가 결과: 엣지케이스 실패 (${items.length}개)`);
       stats.fp += items.length; // expected가 없으니 나온 아이템은 전부 FP
       if (!pass) {
         const actualStrs = items.map((it) => `${it.name}(${it.category})`);
@@ -913,12 +1175,14 @@ async function runEval(model: string, cases: TestCase[]): Promise<ModelStats> {
     }
 
     const pass = caseMatched === testCase.expected.length;
-    console.log(pass ? `통과 (${caseMatched}/${testCase.expected.length})` : `부분/실패 (${caseMatched}/${testCase.expected.length})`);
+    const verdict = pass ? "통과" : caseMatched > 0 ? "부분" : "실패";
+    console.log(`    평가 결과: ${verdict} (${caseMatched}/${testCase.expected.length})`);
     if (!pass) {
       stats.failures.push({
         memo: testCase.memo,
         expected: testCase.expected,
         actual: items.map((it) => `${it.name}(${it.category})`),
+        selectorDropped,
       });
     }
   }
@@ -934,6 +1198,17 @@ function printCaseTrace(memo: string, result: PipelineResult) {
   if (result.activityVerdicts.length > 0) {
     console.log(`    2.5단계 activityVerdicts: ${JSON.stringify(result.activityVerdicts)}`);
   }
+  if (result.selectorInput.length > 0) {
+    console.log(`    Final Selector 입력: ${JSON.stringify(result.selectorInput)}`);
+    if (result.failedStage !== "Final Selector") {
+      const selectedIdSet = new Set(result.selectedIds);
+      const brief = ({ id, name, category }: SelectorCandidate) => ({ id, name, category });
+      const selectedBrief = result.selectorInput.filter((c) => selectedIdSet.has(c.id)).map(brief);
+      const removedBrief = result.selectorInput.filter((c) => !selectedIdSet.has(c.id)).map(brief);
+      console.log(`    Final Selector 선택: ${JSON.stringify(selectedBrief)}`);
+      console.log(`    Final Selector 제거: ${JSON.stringify(removedBrief)}`);
+    }
+  }
   console.log(`    3단계 최종 items: ${JSON.stringify(result.items)}`);
   if (result.failedStage) {
     console.log(`    (주의: ${result.failedStage}에서 schema validation 최종 실패, 이후 단계 미실행)`);
@@ -946,6 +1221,9 @@ function printModelReport(stats: ModelStats) {
     console.log(`- "${f.memo}"`);
     console.log(`    정답: ${f.expected.map((e) => `${e.name}(${e.category})`).join(", ") || "(없음)"}`);
     console.log(`    실제: ${f.actual.join(", ") || "(없음)"}`);
+    if (f.selectorDropped && f.selectorDropped.length > 0) {
+      console.log(`    Selector가 제거한 정답: ${f.selectorDropped.join(", ")}`);
+    }
   }
 }
 
@@ -1021,18 +1299,81 @@ function printExtendedMetrics(stats: ModelStats) {
     console.log(`  - "${f.memo}" → ${f.actual.join(", ") || "(없음)"}`);
   }
 
-  const { stage1, stage2, stage25, stage3 } = stats.stageCallStats;
+  const pct = (num: number, den: number) => (den ? `${((num / den) * 100).toFixed(1)}%` : "-");
+  console.log(`\n[Final Selector] ${FINAL_SELECTOR_ENABLED ? "" : "(FINAL_SELECTOR=off — 입력 전체를 그대로 통과시킴)"}`);
+  console.log(
+    `  Avg Selector Input Items / Case: ${(stats.selectorInputTotal / (stats.selectorEvaluatedCases || 1)).toFixed(2)} ` +
+      `(${stats.selectorInputTotal}개 / ${stats.selectorEvaluatedCases}케이스, Selector 실행 ${stats.selectorRanCases}케이스) ` +
+      `— Selector 미적용 시 최종 아이템 수에 해당`,
+  );
+  console.log(
+    `  Avg Selected Items / Case:       ${(stats.selectorSelectedTotal / (stats.selectorEvaluatedCases || 1)).toFixed(2)} ` +
+      `(${stats.selectorSelectedTotal}개)`,
+  );
+  console.log(
+    `  Selector Input / Selected / Removed Count: ${stats.selectorInputTotal} / ${stats.selectorSelectedTotal} / ` +
+      `${stats.selectorInputTotal - stats.selectorSelectedTotal}`,
+  );
+  console.log(
+    `  Selector Keep Rate:              ${stats.selectorSelectedTotal}/${stats.selectorInputTotal} ` +
+      `(${pct(stats.selectorSelectedTotal, stats.selectorInputTotal)})`,
+  );
+  console.log(
+    `  Expected Item Preservation Rate: ${stats.selectorExpectedPreserved}/${stats.selectorExpectedInInput} ` +
+      `(${pct(stats.selectorExpectedPreserved, stats.selectorExpectedInInput)})`,
+  );
+  console.log(
+    `  Non-expected Removal Rate:       ${stats.selectorNonExpectedRemoved}/${stats.selectorNonExpectedInInput} ` +
+      `(${pct(stats.selectorNonExpectedRemoved, stats.selectorNonExpectedInInput)})`,
+  );
+  console.log(
+    `  엣지케이스 중 Selector가 후보를 전부 제거한 케이스: ${stats.edgeCasesClearedBySelector}/${stats.edgeCaseTotal}`,
+  );
+  const { preSelectorTp: preTp, preSelectorFp: preFp, preSelectorFn: preFn } = stats;
+  const prePrecision = preTp + preFp > 0 ? preTp / (preTp + preFp) : 0;
+  const preRecall = preTp + preFn > 0 ? preTp / (preTp + preFn) : 0;
+  const preF1 = prePrecision + preRecall ? (2 * prePrecision * preRecall) / (prePrecision + preRecall) : 0;
+  console.log(
+    `  Selector 미적용 가정(같은 실행의 Selector 입력 기준): TP=${stats.preSelectorTp}  FP=${stats.preSelectorFp}  ` +
+      `FN=${stats.preSelectorFn}  Precision=${(prePrecision * 100).toFixed(1)}%  Recall=${(preRecall * 100).toFixed(1)}%  ` +
+      `F1=${(preF1 * 100).toFixed(1)}%`,
+  );
+  console.log(
+    `  Selector 적용 최종:                                  Precision=${(precision * 100).toFixed(1)}%  ` +
+      `Recall=${(recall * 100).toFixed(1)}%  F1=${(f1 * 100).toFixed(1)}%`,
+  );
+  console.log(
+    `  기록된 baseline:                                     Precision=${BASELINE_PRF.precision}%  ` +
+      `Recall=${BASELINE_PRF.recall}%  F1=${BASELINE_PRF.f1}%`,
+  );
+  console.log(`  Selector가 제거한 정답 ${stats.selectorDroppedExpected.length}건:`);
+  for (const d of stats.selectorDroppedExpected) {
+    console.log(`    - "${d.memo}" → 정답 "${d.expected}" (제거된 후보: ${d.candidates.join(", ")})`);
+  }
+
+  const { stage1, stage2, stage25, finalSelector, stage3 } = stats.stageCallStats;
   const validRate = (s: StageCallStats) => (s.totalCalls ? (s.validCalls / s.totalCalls) * 100 : 0);
   console.log(`\n[Schema Validation]`);
   console.log(`  stage1 schema valid rate:   ${stage1.validCalls}/${stage1.totalCalls} (${validRate(stage1).toFixed(1)}%)`);
   console.log(`  stage2 schema valid rate:   ${stage2.validCalls}/${stage2.totalCalls} (${validRate(stage2).toFixed(1)}%)`);
   console.log(`  stage2.5 schema valid rate: ${stage25.validCalls}/${stage25.totalCalls} (${validRate(stage25).toFixed(1)}%)`);
+  console.log(
+    `  finalSelector schema valid rate: ${finalSelector.validCalls}/${finalSelector.totalCalls} ` +
+      `(${validRate(finalSelector).toFixed(1)}%)  retry count: ${finalSelector.retries}  ` +
+      `final failure count: ${finalSelector.finalFailures}`,
+  );
   console.log(`  stage3 schema valid rate:   ${stage3.validCalls}/${stage3.totalCalls} (${validRate(stage3).toFixed(1)}%)`);
-  const totalCalls = stage1.totalCalls + stage2.totalCalls + stage25.totalCalls + stage3.totalCalls;
-  const totalValid = stage1.validCalls + stage2.validCalls + stage25.validCalls + stage3.validCalls;
-  const totalRetries = stage1.retries + stage2.retries + stage25.retries + stage3.retries;
+  const totalCalls =
+    stage1.totalCalls + stage2.totalCalls + stage25.totalCalls + finalSelector.totalCalls + stage3.totalCalls;
+  const totalValid =
+    stage1.validCalls + stage2.validCalls + stage25.validCalls + finalSelector.validCalls + stage3.validCalls;
+  const totalRetries = stage1.retries + stage2.retries + stage25.retries + finalSelector.retries + stage3.retries;
   const totalFinalFailures =
-    stage1.finalFailures + stage2.finalFailures + stage25.finalFailures + stage3.finalFailures;
+    stage1.finalFailures +
+    stage2.finalFailures +
+    stage25.finalFailures +
+    finalSelector.finalFailures +
+    stage3.finalFailures;
   console.log(
     `  전체 호출 수: ${totalCalls}  schema validation 실패 수: ${totalCalls - totalValid}  ` +
       `retry 수: ${totalRetries}  최종 실패 수: ${totalFinalFailures}`,
@@ -1047,12 +1388,14 @@ function printExtendedMetrics(stats: ModelStats) {
   const l1 = summarize(stats.latencies.stage1);
   const l2 = summarize(stats.latencies.stage2);
   const l25 = summarize(stats.latencies.stage25);
+  const lfs = summarize(stats.latencies.finalSelector);
   const l3 = summarize(stats.latencies.stage3);
   const lTotal = summarize(stats.latencies.total);
   console.log(`\n[Latency (ms)]`);
   console.log(`  Stage1   avg=${l1.avg.toFixed(0)}  p50=${l1.p50}  p95=${l1.p95}  max=${l1.max}`);
   console.log(`  Stage2   avg=${l2.avg.toFixed(0)}  p50=${l2.p50}  p95=${l2.p95}  max=${l2.max}`);
   console.log(`  Stage2.5 avg=${l25.avg.toFixed(0)}  p50=${l25.p50}  p95=${l25.p95}  max=${l25.max}`);
+  console.log(`  FinalSelector avg=${lfs.avg.toFixed(0)}  p50=${lfs.p50}  p95=${lfs.p95}  max=${lfs.max}`);
   console.log(`  Stage3   avg=${l3.avg.toFixed(0)}  p50=${l3.p50}  p95=${l3.p95}  max=${l3.max}`);
   console.log(`  Total    avg=${lTotal.avg.toFixed(0)}  p50=${lTotal.p50}  p95=${lTotal.p95}  max=${lTotal.max}`);
 }
@@ -1065,6 +1408,7 @@ async function main() {
   console.log(
     `모델 ${models.length}개 x 케이스 ${cases.length}개 비교 시작 (데이터셋: ${DATASET.length}개): ${models.join(", ")}`,
   );
+  console.log(`Final Selector: ${FINAL_SELECTOR_ENABLED ? "on" : "off (baseline)"}`);
 
   const allStats: ModelStats[] = [];
   for (const model of models) {

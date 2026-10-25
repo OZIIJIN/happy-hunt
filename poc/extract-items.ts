@@ -19,9 +19,12 @@
  *     (한 번 모든 KEEP 후보로 범위를 넓혀봤지만 Context Rejection Rate가
  *     41.4%까지 떨어지고 엣지케이스가 94.1%→58.8%로 무너져서 ACTIVITY 전용으로
  *     되돌렸다 — poc/eval-results.md 참고.)
- *   3단계 구체화 — 2단계(ACTIVITY 외) + 2.5단계(COLLECTIBLE로 판정된 ACTIVITY)를
- *     통과한 최종 아이템에 대해서만 아이콘 생성용 visual_description/uniqueness를
- *     만든다 (생존 여부는 다시 판단하지 않는다).
+ *   Final Selector — 2단계(ACTIVITY 외) + 2.5단계(COLLECTIBLE)를 통과한 후보 전체를
+ *     원문과 함께 한 번에 비교해서, 그 순간을 대표하는 수집 아이템의 id만 고른다.
+ *     1단계가 recall 우선이라 주변적/중복 후보가 끝까지 살아남는 문제를 줄인다.
+ *     새 후보 생성이나 name/category/evidence 수정은 하지 않는다.
+ *   3단계 구체화 — Final Selector가 선택한 최종 아이템에 대해서만 아이콘 생성용
+ *     visual_description/uniqueness를 만든다 (생존 여부는 다시 판단하지 않는다).
  * 각 단계가 딱 하나의 일만 하게 나누면, "사람 오분류"는 2단계 분류 문제로,
  * "엣지케이스 과다추출"은 2.5단계 COLLECTIBLE 판정 문제로, "다중 아이템 누락"은
  * 1단계 recall 문제로 분리된다 — 예전처럼 하나의 프롬프트/매치율에 여러 문제가
@@ -373,6 +376,125 @@ NOT_COLLECTIBLE:
 5. 반드시 JSON만 출력한다.`;
 
 // ============================================================
+// Final Selector — 2단계(ACTIVITY 제외 KEEP 카테고리) + 2.5단계(COLLECTIBLE)를
+// 통과한 후보 전체를 한 번에 비교해서, 그 행복 순간을 대표할 수집 아이템만 고른다.
+// 1단계는 recall 우선이라 후보를 넓게 뽑고 2단계 KEEP은 대부분 끝까지 살아남아서,
+// 원문엔 있지만 주변적인 후보가 최종 결과에 많이 섞인다 — 그걸 줄이는 단계다.
+// 새 후보 생성/이름·category·evidence 수정은 하지 않고 id 선택만 시킨다
+// (선택된 id로 기존 candidate 객체를 그대로 필터링해서 3단계로 넘긴다).
+// ============================================================
+
+interface SelectorCandidate {
+  id: number;
+  name: string;
+  category: Category;
+  evidence: string;
+}
+
+/**
+ * Final Selector 스키마는 입력 후보 id 집합에 따라 달라서 호출마다 만든다.
+ * JSON Schema enum으로 입력 id만 고르도록 유도하고, Zod에서 "입력에 없는 id"와
+ * "중복 id"를 다시 검증해 invalid output으로 처리한다(→ 재시도).
+ */
+function finalSelectorSchemas(ids: number[]) {
+  const idSet = new Set(ids);
+  const jsonSchema = {
+    type: "object",
+    properties: {
+      selected_ids: { type: "array", items: { type: "integer", enum: ids } },
+    },
+    required: ["selected_ids"],
+  };
+  const zodSchema = z.object({ selected_ids: z.array(z.number().int()) }).superRefine((value, ctx) => {
+    if (new Set(value.selected_ids).size !== value.selected_ids.length) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "selected_ids에 중복 id가 있다" });
+    }
+    const unknownIds = value.selected_ids.filter((id) => !idSet.has(id));
+    if (unknownIds.length > 0) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `입력에 없는 id: ${unknownIds.join(", ")}` });
+    }
+  });
+  return { jsonSchema, zodSchema };
+}
+
+const FINAL_SELECTOR_SYSTEM_PROMPT = `너는 사용자의 행복한 순간에서 최종적으로 수집할 아이템을 선택하는 역할이다.
+
+입력에는 원문과 이미 추출·분류된 후보들이 주어진다.
+
+후보를 새로 만들지 말고, 주어진 후보 중 실제 수집 아이템으로 적절한 것만 선택하라.
+
+다음 네 기준을 함께 고려한다.
+
+1. 관련성
+- 해당 후보가 이 행복한 순간에서 의미 있는 요소인가?
+- 단순히 문장에 등장했을 뿐인 배경이나 주변 요소는 제외한다.
+
+2. 구체성
+- 독립적인 아이템으로 표현할 만큼 구체적인가?
+- "하루", "곳", "한 잔", "조각"처럼 문맥 없이는 의미가 약한 표현은 제외한다.
+
+3. 근거성
+- 원문과 evidence에서 해당 후보가 명확하게 확인되는가?
+- 원문의 일부를 잘못 잘라 만들어진 후보는 제외한다.
+
+4. 수집 가치
+- 이 아이템을 아이콘으로 받아 나중에 봤을 때 해당 행복한 순간을 떠올리기 좋은가?
+- 단순 배경, 상태, 부수 행동보다 그 순간을 대표하는 구체적인 대상이나 경험을 우선한다.
+
+추가 규칙:
+- 후보 전체를 서로 비교해서 판단한다.
+- 같은 의미를 중복해서 나타내는 후보가 여러 개라면 가장 구체적이고 대표적인 하나만 선택한다.
+- 여러 후보가 각각 독립적으로 그 순간을 잘 대표한다면 여러 개를 선택할 수 있다.
+- 억지로 하나 이상 선택할 필요는 없다.
+- 카테고리가 무엇인지보다 실제 순간을 대표하는지가 더 중요하다.
+- 새로운 아이템을 만들지 않고, 입력에 있는 id만 selected_ids로 반환한다.
+- 선택할 아이템이 없다면 selected_ids를 빈 배열로 반환한다.
+- 반드시 지정된 JSON 형식으로만 응답한다.
+
+예 1:
+원문: "베란다에 누워 쏟아지는 유성우를 한참 바라봤다."
+후보:
+[
+  {"id":1,"name":"베란다","category":"PLACE","evidence":"베란다에 누워"},
+  {"id":2,"name":"유성우","category":"NATURE","evidence":"쏟아지는 유성우"},
+  {"id":3,"name":"유성","category":"NATURE","evidence":"유성우를"}
+]
+결과: {"selected_ids":[2]}
+(유성우가 순간을 가장 잘 대표하며 유성은 중복이고 베란다는 배경에 가깝다.)
+
+예 2:
+원문: "주말 장터에서 산 따끈한 꽈배기를 손난로를 쥔 채 호호 불며 먹었다."
+후보:
+[
+  {"id":1,"name":"장터","category":"PLACE","evidence":"주말 장터에서"},
+  {"id":2,"name":"꽈배기","category":"FOOD","evidence":"따끈한 꽈배기"},
+  {"id":3,"name":"손난로","category":"OBJECT","evidence":"손난로를 쥔 채"}
+]
+결과: {"selected_ids":[2,3]}
+(꽈배기와 손난로는 해당 순간을 기억하게 하는 핵심 요소이고, 장터는 상대적으로 배경 역할이다.)
+
+예 3:
+원문: "할아버지가 손수 담그신 수정과에 인절미 한 조각을 곁들였다."
+후보:
+[
+  {"id":1,"name":"수정과","category":"FOOD","evidence":"수정과"},
+  {"id":2,"name":"인절미","category":"FOOD","evidence":"인절미"},
+  {"id":3,"name":"손수","category":"OBJECT","evidence":"손수"},
+  {"id":4,"name":"한 조각","category":"OBJECT","evidence":"한 조각"}
+]
+결과: {"selected_ids":[1,2]}
+
+예 4:
+원문: "출장길에 우연히 들른 작은 문방구에서 어릴 적 추억에 빠졌다."
+후보:
+[
+  {"id":1,"name":"출장","category":"ACTIVITY","evidence":"출장길에"},
+  {"id":2,"name":"문방구","category":"PLACE","evidence":"작은 문방구에서"}
+]
+결과: {"selected_ids":[2]}
+(문방구 자체가 이 행복한 순간의 핵심 경험이므로 PLACE라도 선택한다.)`;
+
+// ============================================================
 // 3단계 — Item Enrichment: 2단계(ACTIVITY 제외 KEEP 카테고리) + 2.5단계
 // (COLLECTIBLE로 판정된 ACTIVITY)를 통과한 최종 아이템만 아이콘 생성용으로
 // 구체화한다.
@@ -532,11 +654,36 @@ async function main() {
       continue;
     }
 
+    const selectorInput: SelectorCandidate[] = finalKept.map(({ name, category, evidence }, i) => ({
+      id: i + 1,
+      name,
+      category,
+      evidence,
+    }));
+    const { jsonSchema, zodSchema } = finalSelectorSchemas(selectorInput.map((c) => c.id));
+    const finalSelector = await callWithRetry(
+      "Final Selector",
+      FINAL_SELECTOR_SYSTEM_PROMPT,
+      jsonSchema,
+      JSON.stringify({ original_text: memo, candidates: selectorInput }),
+      zodSchema,
+    );
+    trackUsage(finalSelector.response);
+    const selectedIdSet = new Set(finalSelector.data.selected_ids);
+    for (const c of selectorInput) {
+      console.log(`  [Final Selector/${selectedIdSet.has(c.id) ? "선택" : "제거"}] #${c.id} ${c.name}(${c.category})`);
+    }
+    const selected = selectorInput.filter((c) => selectedIdSet.has(c.id));
+    if (selected.length === 0) {
+      console.log("  → 최종 아이템 없음");
+      continue;
+    }
+
     const stage3 = await callWithRetry(
       "3단계 구체화",
       ENRICH_SYSTEM_PROMPT,
       ENRICH_JSON_SCHEMA,
-      JSON.stringify({ items: finalKept.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
+      JSON.stringify({ items: selected.map(({ name, evidence, category }) => ({ name, evidence, category })) }),
       EnrichResult,
     );
     trackUsage(stage3.response);
